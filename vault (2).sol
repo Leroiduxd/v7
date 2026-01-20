@@ -99,7 +99,7 @@ contract BrokexVault {
     // -----------------------------
     // LP Epoch system
     // -----------------------------
-    uint256 public constant EPOCH_DURATION = 1 seconds;
+    uint256 public constant EPOCH_DURATION = 86400 seconds;
     uint256 public currentEpoch;
     uint256 public epochStartTimestamp;
 
