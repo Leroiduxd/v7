@@ -1,714 +1,747 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
 /*
-    BrokexVault V3 (FINAL SECURITY)
-    
-    SECURITY FIXES:
-    - ✅ Epoch Duration: Increased to 4 hours (was 1s) to prevent DoS/Gas griefing.
-    - ✅ ReentrancyGuard: Added to all deposit/withdraw functions.
-    - Logic: Connects to Core V17 via updateUnrealizedPnl checks.
+    BROKEX CORE V17 (FINAL SECURITY HARDCAP)
+    - Logic: Full Trading Engine (V15 Base)
+    - Feature: Per-Asset Oracle Freshness
+    - Security: Hardcapped Oracle Delay (Min 15s - Max 90s)
+    - Oracle: SupraOracles V2 Integration
 */
 
 // ==========================================
-// INTERFACES & UTILS
+// INTERFACES
 // ==========================================
 
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+interface ISupraOraclePull {
+    struct PriceInfo {
+        uint256[] pairs;
+        uint256[] prices;
+        uint256[] timestamp;
+        uint256[] decimal;
+        uint256[] round;
+    }
+    function verifyOracleProofV2(bytes calldata _bytesProof) external returns (PriceInfo memory);
 }
 
-interface IBrokexCore {
-    function getLastFinishedPnlRun() external view returns (int256 pnl, uint64 timestamp);
-}
-
-// Simple Reentrancy Guard (Gas efficient)
-abstract contract ReentrancyGuard {
-    uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
-    uint256 private _status;
-
-    constructor() {
-        _status = _NOT_ENTERED;
-    }
-
-    modifier nonReentrant() {
-        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
-        _status = _ENTERED;
-        _;
-        _status = _NOT_ENTERED;
-    }
+interface IBrokexVault {
+    function createOrder(uint256 tradeId, address trader, uint256 margin6, uint256 commission6, uint256 lpLock6) external;
+    function executeOrder(uint256 tradeId) external;
+    function cancelOrder(uint256 tradeId) external;
+    function createPosition(uint256 tradeId, address trader, uint256 margin6, uint256 commission6, uint256 lpLock6) external;
+    function closeTrade(uint256 tradeId, int256 pnl18) external;
+    function liquidate(uint256 tradeId) external;
 }
 
 // ==========================================
 // CONTRACT
 // ==========================================
 
-contract BrokexVault is ReentrancyGuard {
-    // -----------------------------
-    // Constants / units
-    // -----------------------------
-    uint8 public constant STABLE_DECIMALS = 6;
-    uint256 private constant WAD = 1e18;
-    uint256 private constant USDC_TO_WAD = 1e12;
+contract BrokexCore {
+    // ----------------------------------------------------------------
+    // 1. CONSTANTES & STATE
+    // ----------------------------------------------------------------
 
-    // Fees (basis points)
-    uint256 public constant COMMISSION_OWNER_BPS = 3000; // 30%
-    uint256 public constant COMMISSION_BPS_DENOM = 10000;
+    uint256 constant SECONDS_PER_WEEK = 604800;
+    uint256 constant OFFSET_TO_MONDAY = 259200; // 3 jours * 86400 (Jeudi -> Lundi)
 
-    uint256 public constant PROFIT_FEE_LP_BPS = 100; // 1% of trader profit
-    uint256 public constant PROFIT_FEE_DENOM = 10000;
+    ISupraOraclePull public immutable oracle;
+    IBrokexVault public brokexVault;
+    address public immutable owner;
 
-    // Dust threshold: 5 USD
-    uint256 public constant DUST_CAPITAL6 = 5_000_000; 
-
-    // -----------------------------
-    // Roles & Tokens
-    // -----------------------------
-    address public owner;
-    address public core;      
-    bool public coreSet;      
-    IERC20 public usdc;       
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
-    }
-
-    modifier onlyCore() {
-        require(msg.sender == core, "Not core");
-        _;
-    }
-
-    // -----------------------------
-    // Trader balances (Accounting)
-    // -----------------------------
-    mapping(address => uint256) public freeBalance;    
-    mapping(address => uint256) public lockedBalance;  
-
-    // -----------------------------
-    // LP capital accounting
-    // -----------------------------
-    uint256 public lpFreeCapital;     
-    uint256 public lpLockedCapital;   
-
-    // -----------------------------
-    // Trades
-    // -----------------------------
-    enum TradeState { Pending, Open, Closed, Cancelled }
+    uint256 public nextTradeID;
+    uint256 public listedAssetsCount;
 
     struct Trade {
-        uint256 id;
-        address owner;        
-        uint256 margin;       
-        uint256 commission;   
-        uint256 lpLock;       
-        TradeState state;
+        address trader;
+        uint32 assetId;
+        bool isLong;
+        uint8 leverage;
+        uint48 openPrice;      
+        uint8 state; // 0=Order, 1=Open, 2=Closed, 3=Cancelled
+        uint32 openTimestamp;
+        uint128 fundingIndex;
+        uint48 closePrice;     
+        int32 lotSize;
+        uint48 stopLoss;
+        uint48 takeProfit;
+        uint64 lpLockedCapital;
+        uint64 marginUsdc;
+    }
+
+    struct Asset {
+        uint32 assetId;
+        uint32 numerator;       
+        uint32 denominator;     
+        uint32 baseFundingRate;
+        uint32 spread;
+        uint32 commission;
+        uint32 weekendFunding;
+        uint16 securityMultiplier;
+        uint16 maxPhysicalMove;
+        uint8  maxLeverage;
+        uint32 maxLongLots;     // RISK: Max Long Exposure
+        uint32 maxShortLots;    // RISK: Max Short Exposure
+        uint32 maxOracleDelay;  // ✅ NEW: Specific Oracle freshness (seconds)
+        bool allowOpen;         // Trade allowed?
+        bool listed;
+    }
+
+    struct Exposure {
+        int32 longLots;
+        int32 shortLots;
+        uint128 longValueSum;   
+        uint128 shortValueSum;
+        uint128 longMaxProfit;  
+        uint128 shortMaxProfit;
+        uint128 longMaxLoss;    
+        uint128 shortMaxLoss;
+    }
+
+    struct FundingState {
+        uint64 lastUpdate;
+        uint128 longFundingIndex;
+        uint128 shortFundingIndex;
+    }
+
+    struct PnlRun {
+        uint64 runId;
+        uint64 startTimestamp;
+        uint64 endTimestamp;
+        uint32 assetsProcessed;
+        uint32 totalAssetsAtStart;
+        int256 cumulativePnlX6;
+        bool completed;
     }
 
     mapping(uint256 => Trade) public trades;
-
-    // -----------------------------
-    // LP Epoch system
-    // -----------------------------
-    // ✅ SECURITY FIX: 4 HOURS (14400s) instead of 1s
-    uint256 public constant EPOCH_DURATION = 14400; 
+    mapping(uint32 => Asset) public assets;
+    mapping(uint32 => Exposure) public exposures;
+    mapping(uint32 => FundingState) public fundingStates;
     
-    uint256 public currentEpoch;
-    uint256 public epochStartTimestamp;
+    // PnL State
+    uint64 public currentPnlRunId;
+    mapping(uint64 => PnlRun) public pnlRuns;
+    mapping(uint64 => mapping(uint32 => bool)) public assetProcessedInRun;
+    bool public pnlCalculationActive;
 
-    mapping(uint256 => uint256) public lpTokenPrice;
-    mapping(uint256 => int256)  public epochEquitySnapshot18;
-    uint256 public totalShares;
+    event TradeEvent(uint256 tradeId, uint8 code);
+    event PnlRunStarted(uint64 runId, uint32 totalAssets);
+    event PnlRunCompleted(uint64 runId, int256 finalPnl);
+    event PnlRunExpired(uint64 runId);
 
-    mapping(uint256 => uint256) public totalPendingDeposits;
-    mapping(address => mapping(uint256 => uint256)) public pendingDepositOf;
-    mapping(address => uint256[]) public epochsWithDeposits;
-    mapping(address => mapping(uint256 => bool)) public epochListed;
+    modifier onlyOwner() { require(msg.sender == owner, "ONLY_OWNER"); _; }
 
-    // -----------------------------
-    // LP Withdraw system
-    // -----------------------------
-    struct WithdrawBucket {
-        uint256 totalSharesInitial18;
-        uint256 sharesRemaining18;
-        uint256 totalUsdAllocated6;
-    }
-
-    struct UserWithdraw {
-        uint256 sharesRequested18;
-        uint256 usdWithdrawn6;
-    }
-
-    mapping(uint256 => WithdrawBucket) public withdrawBuckets;
-    mapping(uint256 => mapping(address => UserWithdraw)) public userWithdraws;
-    mapping(address => uint256[]) public withdrawEpochsOf;
-    mapping(address => mapping(uint256 => bool)) public withdrawEpochListed;
-
-    uint256 public oldestWithdrawEpoch;
-    bool public hasWithdrawBuckets;
-
-    struct PayoutTranche {
-        uint256 sharesRemaining18;
-        uint256 priceWad;
-    }
-
-    mapping(uint256 => PayoutTranche) public payoutByEpoch;
-    uint256 public oldestPayoutEpoch;
-    bool public hasPayoutTranches;
-
-    uint256 public totalWithdrawSharesOutstanding18;
-    uint256 public totalPaidSharesPendingAlloc18;
-
-    // -----------------------------
-    // Withdraw reserve guard
-    // -----------------------------
-    uint256 public withdrawSharesUnfunded18;
-    uint256 public minLpFreeReserve6;
-
-    // -----------------------------
-    // Events
-    // -----------------------------
-    event OwnerChanged(address indexed oldOwner, address indexed newOwner);
-    event CoreSet(address indexed core);
-    event TraderDeposit(address indexed trader, uint256 amount6);
-    event TraderWithdraw(address indexed trader, uint256 amount6);
-    event OrderCreated(uint256 indexed tradeId, address indexed trader, uint256 margin6, uint256 commission6, uint256 lpLock6);
-    event OrderExecuted(uint256 indexed tradeId);
-    event OrderCancelled(uint256 indexed tradeId);
-    event PositionCreated(uint256 indexed tradeId, address indexed trader, uint256 margin6, uint256 commission6, uint256 lpLock6);
-    event TradeClosed(uint256 indexed tradeId, int256 pnl18, int256 actualPnl18);
-    event TradeLiquidated(uint256 indexed tradeId, uint256 marginSeized6);
-    event LpDepositRequested(address indexed lp, uint256 indexed epoch, uint256 newPending6, uint256 delta6);
-    event LpDepositReduced(address indexed lp, uint256 indexed epoch, uint256 newPending6, uint256 delta6);
-    event WithdrawRequested(address indexed lp, uint256 indexed requestEpoch, uint256 sharesAdded18, uint256 newUserShares18, uint256 newBucketTotalShares18);
-    event WithdrawClaimed(address indexed lp, uint256 indexed requestEpoch, uint256 amount6);
-    event PayoutCreated(uint256 indexed payEpoch, uint256 sharesPaid18, uint256 usdReserved6, uint256 priceWad);
-    event PayoutAssignedToBucket(uint256 indexed payEpoch, uint256 indexed bucketEpoch, uint256 sharesAssigned18, uint256 usdAllocated6);
-    event EpochRolled(uint256 indexed epochClosed, uint256 indexed epochOpened, uint256 priceWad, int256 equitySnapshot18, uint256 depositsAdded6, uint256 sharesMinted18);
-    event DustSwept(uint256 capitalSwept6);
-
-    // -----------------------------
-    // Constructor & Settings
-    // -----------------------------
-    constructor(address _usdc) {
-        require(_usdc != address(0), "Invalid USDC");
+    constructor(address _oracle) {
         owner = msg.sender;
-        currentEpoch = 0;
-        epochStartTimestamp = block.timestamp;
-        usdc = IERC20(_usdc);
+        oracle = ISupraOraclePull(_oracle);
     }
 
-    function setOwner(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "owner=0");
-        emit OwnerChanged(owner, newOwner);
-        owner = newOwner;
+    function setBrokexVault(address vault) external onlyOwner {
+        require(vault != address(0), "ZERO_ADDR");
+        brokexVault = IBrokexVault(vault);
     }
 
-    function setCore(address _core) external onlyOwner {
-        require(!coreSet, "Core already set");
-        require(_core != address(0), "Invalid core");
-        core = _core;
-        coreSet = true;
-        emit CoreSet(_core);
-    }
+    // ----------------------------------------------------------------
+    // 2. ORACLE HELPER (ADAPTIVE DELAY)
+    // ----------------------------------------------------------------
 
-    // -----------------------------
-    // Helpers
-    // -----------------------------
-    function _toWadFrom6(uint256 amount6) internal pure returns (uint256) { return amount6 * USDC_TO_WAD; }
-    function _to6FromWad(uint256 amount18) internal pure returns (uint256) { return amount18 / USDC_TO_WAD; }
+    function _getVerifiedPrice(bytes calldata _bytesProof, uint32 _assetId) internal returns (uint256 price1e6) {
+        ISupraOraclePull.PriceInfo memory info = oracle.verifyOracleProofV2(_bytesProof);
+        
+        uint256 len = info.pairs.length;
+        bool found = false;
+        uint256 index;
 
-    function _mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
-        unchecked {
-            uint256 prod0; uint256 prod1;
-            assembly {
-                let mm := mulmod(x, y, not(0))
-                prod0 := mul(x, y)
-                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+        for(uint256 i = 0; i < len; i++) {
+            if(info.pairs[i] == uint256(_assetId)) {
+                index = i;
+                found = true;
+                break;
             }
-            if (prod1 == 0) { require(denominator > 0, "div0"); return prod0 / denominator; }
-            require(denominator > prod1, "overflow");
-            uint256 remainder;
-            assembly {
-                remainder := mulmod(x, y, denominator)
-                prod1 := sub(prod1, gt(remainder, prod0))
-                prod0 := sub(prod0, remainder)
-            }
-            uint256 twos = denominator & (~denominator + 1);
-            assembly {
-                denominator := div(denominator, twos)
-                prod0 := div(prod0, twos)
-                twos := add(div(sub(0, twos), twos), 1)
-            }
-            prod0 |= prod1 * twos;
-            uint256 inverse = (3 * denominator) ^ 2;
-            inverse *= 2 - denominator * inverse; inverse *= 2 - denominator * inverse;
-            inverse *= 2 - denominator * inverse; inverse *= 2 - denominator * inverse;
-            inverse *= 2 - denominator * inverse;
-            result = prod0 * inverse;
-            return result;
         }
-    }
+        
+        require(found, "PAIR_NOT_IN_PROOF");
+        
+        // CORRECTION TIMESTAMP (MS -> SEC)
+        uint256 oracleTime = info.timestamp[index];
+        if (oracleTime > 1000000000000) {
+            oracleTime = oracleTime / 1000;
+        }
 
-    // -----------------------------
-    // Dust handling
-    // -----------------------------
-    function _totalLpCapital6() internal view returns (uint256) {
-        return lpFreeCapital + lpLockedCapital;
-    }
+        require(block.timestamp >= oracleTime, "FUTURE_PROOF");
+        
+        // ✅ ADAPTIVE DELAY CHECK
+        uint256 allowedDelay = uint256(assets[_assetId].maxOracleDelay);
+        if (allowedDelay == 0) allowedDelay = 60; // Fallback default if not set
+        
+        require(block.timestamp - oracleTime <= allowedDelay, "STALE_PRICE");
 
-    function sweepDust() public {
-        uint256 cap6 = _totalLpCapital6();
-        if (cap6 == 0) return;
-        if (cap6 >= DUST_CAPITAL6) return;
+        uint256 rawPrice = info.prices[index];
+        uint256 decimals = info.decimal[index];
 
-        freeBalance[owner] += cap6;
-        lpFreeCapital = 0; lpLockedCapital = 0; totalShares = 0;
-        withdrawSharesUnfunded18 = 0; minLpFreeReserve6 = 0;
-        emit DustSwept(cap6);
-    }
-
-    // -----------------------------
-    // Trader funds (Real USDC)
-    // -----------------------------
-    // ✅ Added nonReentrant
-    function traderDeposit(uint256 amount6) external nonReentrant {
-        require(amount6 > 0, "amount=0");
-        bool success = usdc.transferFrom(msg.sender, address(this), amount6);
-        require(success, "Transfer failed");
-        freeBalance[msg.sender] += amount6;
-        emit TraderDeposit(msg.sender, amount6);
-    }
-
-    // ✅ Added nonReentrant
-    function traderWithdraw(uint256 amount6) external nonReentrant {
-        require(amount6 > 0, "amount=0");
-        require(freeBalance[msg.sender] >= amount6, "insufficient free");
-        freeBalance[msg.sender] -= amount6;
-        bool success = usdc.transfer(msg.sender, amount6);
-        require(success, "Transfer failed");
-        emit TraderWithdraw(msg.sender, amount6);
-    }
-
-    function _lockTrader(address trader, uint256 amount6) internal {
-        require(freeBalance[trader] >= amount6, "insufficient free to lock");
-        freeBalance[trader] -= amount6;
-        lockedBalance[trader] += amount6;
-    }
-
-    function _unlockTrader(address trader, uint256 amount6) internal {
-        require(lockedBalance[trader] >= amount6, "insufficient locked");
-        lockedBalance[trader] -= amount6;
-        freeBalance[trader] += amount6;
-    }
-
-    function _lpLock(uint256 amount6) internal {
-        require(lpFreeCapital >= (minLpFreeReserve6 + amount6), "lpFree reserved for withdrawals");
-        lpFreeCapital -= amount6;
-        lpLockedCapital += amount6;
-    }
-
-    function _lpUnlock(uint256 amount6) internal {
-        require(lpLockedCapital >= amount6, "lpLocked underflow");
-        lpLockedCapital -= amount6;
-        lpFreeCapital += amount6;
-    }
-
-    function _collectCommission(address trader, uint256 commission6) internal {
-        require(lockedBalance[trader] >= commission6, "locked < commission");
-        lockedBalance[trader] -= commission6;
-        uint256 ownerCut6 = (commission6 * COMMISSION_OWNER_BPS) / COMMISSION_BPS_DENOM;
-        uint256 lpCut6 = commission6 - ownerCut6;
-        if (ownerCut6 > 0) freeBalance[owner] += ownerCut6;
-        if (lpCut6 > 0) lpFreeCapital += lpCut6;
-    }
-
-    function _unlockAndSettle(address trader, uint256 marginLocked6, int256 pnl18) internal {
-        require(lockedBalance[trader] >= marginLocked6, "locked < margin");
-        lockedBalance[trader] -= marginLocked6;
-
-        if (pnl18 >= 0) {
-            uint256 profit6 = _to6FromWad(uint256(pnl18));
-            require(lpFreeCapital >= profit6, "lp insolvent (profit)");
-            uint256 fee6 = (profit6 * PROFIT_FEE_LP_BPS) / PROFIT_FEE_DENOM;
-            uint256 payoutProfit6 = profit6 - fee6;
-            freeBalance[trader] += (marginLocked6 + payoutProfit6);
-            lpFreeCapital -= payoutProfit6;
+        if (decimals > 6) {
+            price1e6 = rawPrice / (10 ** (decimals - 6));
+        } else if (decimals < 6) {
+            price1e6 = rawPrice * (10 ** (6 - decimals));
         } else {
-            uint256 loss6 = _to6FromWad(uint256(-pnl18));
-            if (loss6 > marginLocked6) loss6 = marginLocked6;
-            freeBalance[trader] += (marginLocked6 - loss6);
-            lpFreeCapital += loss6;
+            price1e6 = rawPrice;
         }
     }
 
-    // -----------------------------
-    // Trades: Restricted to Core
-    // -----------------------------
-    function createOrder(uint256 tradeId, address trader, uint256 margin6, uint256 commission6, uint256 lpLock6) external onlyCore {
-        require(trader != address(0), "trader=0");
-        require(trades[tradeId].id == 0, "tradeId exists");
-        require(margin6 > 0, "margin=0");
-        require(lpLock6 > 0, "lpLock=0");
-        _lockTrader(trader, margin6 + commission6);
-        trades[tradeId] = Trade({id: tradeId, owner: trader, margin: margin6, commission: commission6, lpLock: lpLock6, state: TradeState.Pending});
-        emit OrderCreated(tradeId, trader, margin6, commission6, lpLock6);
+    // ----------------------------------------------------------------
+    // 3. ADMIN & RISK MANAGEMENT
+    // ----------------------------------------------------------------
+
+    function listAsset(
+        uint32 assetId, uint32 numerator, uint32 denominator, uint32 baseFundingRate, 
+        uint32 spread, uint32 commission, uint32 weekendFunding, 
+        uint16 securityMultiplier, uint16 maxPhysicalMove, uint8 maxLeverage
+    ) external onlyOwner {
+        require(!assets[assetId].listed, "ALREADY_LISTED");
+        require(numerator > 0 && denominator > 0, "BAD_RATIO");
+
+        assets[assetId] = Asset({
+            assetId: assetId, numerator: numerator, denominator: denominator,
+            baseFundingRate: baseFundingRate, spread: spread, commission: commission,
+            weekendFunding: weekendFunding, securityMultiplier: securityMultiplier,
+            maxPhysicalMove: maxPhysicalMove, maxLeverage: maxLeverage, 
+            maxLongLots: 1000000, 
+            maxShortLots: 1000000, 
+            maxOracleDelay: 60, // Default 60s
+            allowOpen: true,
+            listed: true
+        });
+        listedAssetsCount++;
     }
 
-    function executeOrder(uint256 tradeId) external onlyCore {
-        Trade storage t = trades[tradeId];
-        require(t.id != 0, "trade missing");
-        require(t.state == TradeState.Pending, "not pending");
-        _lpLock(t.lpLock);
-        _collectCommission(t.owner, t.commission);
-        t.state = TradeState.Open;
-        emit OrderExecuted(tradeId);
+    // ✅ UPDATE: Hardcapped to 90s max
+    function setAssetOracleDelay(uint32 assetId, uint32 newDelay) external onlyOwner {
+        require(assets[assetId].listed, "UNKNOWN_ASSET");
+        require(newDelay >= 15, "DELAY_TOO_SHORT"); // Minimum 15s
+        require(newDelay <= 90, "DELAY_TOO_LONG");  // Maximum 90s
+        assets[assetId].maxOracleDelay = newDelay;
     }
 
-    function cancelOrder(uint256 tradeId) external onlyCore {
-        Trade storage t = trades[tradeId];
-        require(t.id != 0, "trade missing");
-        require(t.state == TradeState.Pending, "not pending");
-        t.state = TradeState.Cancelled;
-        _unlockTrader(t.owner, t.margin + t.commission);
-        emit OrderCancelled(tradeId);
+    function setAssetRiskLimits(uint32 assetId, uint32 _maxLongLots, uint32 _maxShortLots) external onlyOwner {
+        require(assets[assetId].listed, "UNKNOWN_ASSET");
+        assets[assetId].maxLongLots = _maxLongLots;
+        assets[assetId].maxShortLots = _maxShortLots;
     }
 
-    function createPosition(uint256 tradeId, address trader, uint256 margin6, uint256 commission6, uint256 lpLock6) external onlyCore {
-        require(trader != address(0), "trader=0");
-        require(trades[tradeId].id == 0, "tradeId exists");
-        require(margin6 > 0, "margin=0");
-        require(lpLock6 > 0, "lpLock=0");
-        _lockTrader(trader, margin6 + commission6);
-        _lpLock(lpLock6);
-        _collectCommission(trader, commission6);
-        trades[tradeId] = Trade({id: tradeId, owner: trader, margin: margin6, commission: commission6, lpLock: lpLock6, state: TradeState.Open});
-        emit PositionCreated(tradeId, trader, margin6, commission6, lpLock6);
+    function setAssetTradable(uint32 assetId, bool _allowOpen) external onlyOwner {
+        require(assets[assetId].listed, "UNKNOWN_ASSET");
+        assets[assetId].allowOpen = _allowOpen;
     }
 
-    function closeTrade(uint256 tradeId, int256 pnl18) external onlyCore {
-        Trade storage t = trades[tradeId];
-        require(t.id != 0, "trade missing");
-        require(t.state == TradeState.Open, "not open");
-        int256 actualPnl18 = pnl18;
-        if (pnl18 > 0) {
-            uint256 maxProfit18 = _toWadFrom6(t.lpLock);
-            if (uint256(pnl18) > maxProfit18) actualPnl18 = int256(maxProfit18);
-        } else if (pnl18 < 0) {
-            uint256 maxLoss18 = _toWadFrom6(t.margin);
-            if (uint256(-pnl18) > maxLoss18) actualPnl18 = -int256(maxLoss18);
-        }
-        _lpUnlock(t.lpLock);
-        _unlockAndSettle(t.owner, t.margin, actualPnl18);
-        t.state = TradeState.Closed;
-        emit TradeClosed(tradeId, pnl18, actualPnl18);
+    function removeAsset(uint32 assetId) external onlyOwner {
+        require(assets[assetId].listed, "UNKNOWN_ASSET");
+        Exposure storage e = exposures[assetId];
+        require(e.longLots == 0 && e.shortLots == 0, "EXPOSURE_NOT_ZERO");
+        delete assets[assetId];
     }
 
-    function liquidate(uint256 tradeId) external onlyCore {
-        Trade storage t = trades[tradeId];
-        require(t.id != 0, "trade missing");
-        require(t.state == TradeState.Open, "not open");
-        _lpUnlock(t.lpLock);
-        _unlockAndSettle(t.owner, t.margin, -int256(_toWadFrom6(t.margin)));
-        t.state = TradeState.Closed;
-        emit TradeLiquidated(tradeId, t.margin);
+    function updateLotSize(uint32 assetId, uint32 newNum, uint32 newDen) external onlyOwner {
+        Exposure storage e = exposures[assetId];
+        require(e.longLots == 0 && e.shortLots == 0, "EXPOSURE_NOT_ZERO");
+        assets[assetId].numerator = newNum;
+        assets[assetId].denominator = newDen;
     }
 
-    // -----------------------------
-    // LP: deposit requests
-    // -----------------------------
-    // ✅ Added nonReentrant
-    function requestLpDeposit(uint256 amount6) external nonReentrant {
-        require(amount6 > 0, "amount=0");
-        bool success = usdc.transferFrom(msg.sender, address(this), amount6);
-        require(success, "Transfer failed");
+    // ----------------------------------------------------------------
+    // 4. LOGIQUE D'EXPOSITION (SECURED)
+    // ----------------------------------------------------------------
 
-        uint256 e = currentEpoch;
-        if (!epochListed[msg.sender][e]) {
-            epochListed[msg.sender][e] = true;
-            epochsWithDeposits[msg.sender].push(e);
-        }
-        pendingDepositOf[msg.sender][e] += amount6;
-        totalPendingDeposits[e] += amount6;
-        emit LpDepositRequested(msg.sender, e, pendingDepositOf[msg.sender][e], amount6);
-    }
+    function _updateExposure(uint32 assetId, int32 lotSize, uint48 price, bool isLong, bool increase) internal {
+        Exposure storage e = exposures[assetId];
+        uint256 rawVal = _getNotionalValue(assetId, uint256(price), uint32(lotSize));
+        uint128 value = uint128(rawVal);
 
-    // ✅ Added nonReentrant
-    function reduceLpDeposit(uint256 amount6) external nonReentrant {
-        require(amount6 > 0, "amount=0");
-        uint256 e = currentEpoch;
-        uint256 cur = pendingDepositOf[msg.sender][e];
-        require(cur >= amount6, "reduce > pending");
-
-        pendingDepositOf[msg.sender][e] = cur - amount6;
-        totalPendingDeposits[e] -= amount6;
-
-        bool success = usdc.transfer(msg.sender, amount6);
-        require(success, "Transfer failed");
-        emit LpDepositReduced(msg.sender, e, pendingDepositOf[msg.sender][e], amount6);
-    }
-
-    // -----------------------------
-    // LP: withdrawal request
-    // -----------------------------
-    function requestLpWithdrawFromEpochs(uint256[] calldata depositEpochs) external {
-        uint256 reqEpoch = currentEpoch;
-        if (!withdrawEpochListed[msg.sender][reqEpoch]) {
-            withdrawEpochListed[msg.sender][reqEpoch] = true;
-            withdrawEpochsOf[msg.sender].push(reqEpoch);
-        }
-
-        uint256 sharesToAdd18 = 0;
-        for (uint256 i = 0; i < depositEpochs.length; i++) {
-            uint256 e = depositEpochs[i];
-            uint256 dep6 = pendingDepositOf[msg.sender][e];
-            require(dep6 > 0, "empty deposit epoch");
-            uint256 price = lpTokenPrice[e];
-            require(price > 0, "epoch not closed");
-            uint256 dep18 = _toWadFrom6(dep6);
-            uint256 shares18 = (dep18 * WAD) / price;
-            pendingDepositOf[msg.sender][e] = 0; 
-            sharesToAdd18 += shares18;
-        }
-        require(sharesToAdd18 > 0, "shares=0");
-
-        WithdrawBucket storage b = withdrawBuckets[reqEpoch];
-        b.totalSharesInitial18 += sharesToAdd18;
-        b.sharesRemaining18 += sharesToAdd18;
-
-        UserWithdraw storage u = userWithdraws[reqEpoch][msg.sender];
-        u.sharesRequested18 += sharesToAdd18;
-
-        if (!hasWithdrawBuckets) {
-            hasWithdrawBuckets = true;
-            oldestWithdrawEpoch = reqEpoch;
-        }
-        totalWithdrawSharesOutstanding18 += sharesToAdd18;
-        withdrawSharesUnfunded18 += sharesToAdd18;
-        emit WithdrawRequested(msg.sender, reqEpoch, sharesToAdd18, u.sharesRequested18, b.totalSharesInitial18);
-    }
-
-    // -----------------------------
-    // Epoch rollover
-    // -----------------------------
-    bool public firstRollDone;
-
-    function rollEpoch() external {
-        if (!firstRollDone) {
-            require(msg.sender == owner, "First roll: owner only");
-        }
-        require(block.timestamp >= epochStartTimestamp + EPOCH_DURATION, "epoch not ended");
-
-        require(core != address(0), "Core not set");
-        (int256 pnlCore, uint64 tsCore) = IBrokexCore(core).getLastFinishedPnlRun();
-        
-        require(block.timestamp >= tsCore, "PnL in future?");
-        require(block.timestamp - tsCore <= 120, "PnL stale (>2min)");
-        
-        int256 unrealizedPnlTraders18 = pnlCore;
-
-        if (_totalLpCapital6() > 0 && _totalLpCapital6() < DUST_CAPITAL6) {
-            sweepDust();
-            unrealizedPnlTraders18 = 0;
-        }
-
-        uint256 e = currentEpoch;
-        int256 lpEquity18 = int256(_toWadFrom6(lpFreeCapital + lpLockedCapital));
-        int256 equity18 = lpEquity18 - unrealizedPnlTraders18;
-        uint256 priceWad;
-
-        if (totalShares == 0) {
-            require(unrealizedPnlTraders18 == 0, "unrealizedPnL must be 0 when totalShares=0");
-            priceWad = WAD;
-            require(equity18 >= 0, "equity<0");
+        if (isLong) {
+            if (increase) {
+                // RISK CHECK: Max Long Limit
+                require(uint256(uint256(int256(e.longLots))) + uint256(uint32(lotSize)) <= uint256(assets[assetId].maxLongLots), "MAX_LONG_LIMIT");
+                e.longLots += lotSize;
+                e.longValueSum += value;
+            } else {
+                e.longLots -= lotSize;
+                e.longValueSum = _safeSub(e.longValueSum, value);
+            }
         } else {
-            require(equity18 > 0, "equity<=0");
-            priceWad = (uint256(equity18) * WAD) / totalShares;
-            require(priceWad > 0, "price=0");
-        }
-
-        lpTokenPrice[e] = priceWad;
-        epochEquitySnapshot18[e] = equity18;
-
-        uint256 deposits6 = totalPendingDeposits[e];
-        uint256 sharesMinted18 = 0;
-        if (deposits6 > 0) {
-            uint256 deposits18 = _toWadFrom6(deposits6);
-            sharesMinted18 = (deposits18 * WAD) / priceWad;
-            totalShares += sharesMinted18;
-            lpFreeCapital += deposits6;
-        }
-
-        uint256 unpaidMinusPaid18 = 0;
-        if (totalWithdrawSharesOutstanding18 > totalPaidSharesPendingAlloc18) {
-            unpaidMinusPaid18 = totalWithdrawSharesOutstanding18 - totalPaidSharesPendingAlloc18;
-        }
-
-        if (unpaidMinusPaid18 > 0 && lpFreeCapital > 0) {
-            uint256 free18 = _toWadFrom6(lpFreeCapital);
-            uint256 maxPayShares18 = (free18 * WAD) / priceWad;
-            uint256 payShares18 = maxPayShares18;
-            if (payShares18 > unpaidMinusPaid18) payShares18 = unpaidMinusPaid18;
-            if (payShares18 > withdrawSharesUnfunded18) payShares18 = withdrawSharesUnfunded18;
-
-            if (payShares18 > 0) {
-                uint256 usdReserved6 = _to6FromWad(_mulDiv(payShares18, priceWad, WAD));
-                require(lpFreeCapital >= usdReserved6, "lpFree < reserve");
-                lpFreeCapital -= usdReserved6;
-                require(totalShares >= payShares18, "totalShares underflow");
-                totalShares -= payShares18;
-                withdrawSharesUnfunded18 -= payShares18;
-
-                PayoutTranche storage pt = payoutByEpoch[e];
-                pt.sharesRemaining18 += payShares18;
-                pt.priceWad = priceWad;
-                totalPaidSharesPendingAlloc18 += payShares18;
-
-                if (!hasPayoutTranches) {
-                    hasPayoutTranches = true;
-                    oldestPayoutEpoch = e;
-                }
-                emit PayoutCreated(e, payShares18, usdReserved6, priceWad);
+            if (increase) {
+                // RISK CHECK: Max Short Limit
+                require(uint256(uint256(int256(e.shortLots))) + uint256(uint32(lotSize)) <= uint256(assets[assetId].maxShortLots), "MAX_SHORT_LIMIT");
+                e.shortLots += lotSize;
+                e.shortValueSum += value;
+            } else {
+                e.shortLots -= lotSize;
+                e.shortValueSum = _safeSub(e.shortValueSum, value);
             }
-        }
-
-        if (withdrawSharesUnfunded18 == 0) minLpFreeReserve6 = 0;
-        else minLpFreeReserve6 = _to6FromWad(_mulDiv(withdrawSharesUnfunded18, priceWad, WAD));
-
-        currentEpoch = e + 1;
-        epochStartTimestamp = block.timestamp;
-        if (!firstRollDone) firstRollDone = true;
-        emit EpochRolled(e, currentEpoch, priceWad, equity18, deposits6, sharesMinted18);
-    }
-
-    function processWithdrawals(uint256 maxSteps) external {
-        require(maxSteps > 0, "steps=0");
-        if (!hasPayoutTranches || !hasWithdrawBuckets) return;
-
-        uint256 steps = 0;
-        uint256 payEpoch = oldestPayoutEpoch;
-        uint256 bucketEpoch = oldestWithdrawEpoch;
-
-        while (steps < maxSteps) {
-            PayoutTranche storage pt = payoutByEpoch[payEpoch];
-            WithdrawBucket storage b = withdrawBuckets[bucketEpoch];
-
-            if (pt.sharesRemaining18 == 0) {
-                payEpoch = payEpoch + 1;
-                oldestPayoutEpoch = payEpoch;
-                if (payEpoch >= currentEpoch) break;
-                steps++;
-                continue;
-            }
-            if (b.sharesRemaining18 == 0) {
-                bucketEpoch = bucketEpoch + 1;
-                oldestWithdrawEpoch = bucketEpoch;
-                if (bucketEpoch >= currentEpoch) break;
-                steps++;
-                continue;
-            }
-
-            uint256 assign18 = pt.sharesRemaining18;
-            if (assign18 > b.sharesRemaining18) assign18 = b.sharesRemaining18;
-
-            uint256 usdAllocated6 = _to6FromWad(_mulDiv(assign18, pt.priceWad, WAD));
-            b.totalUsdAllocated6 += usdAllocated6;
-            b.sharesRemaining18 -= assign18;
-            pt.sharesRemaining18 -= assign18;
-
-            totalPaidSharesPendingAlloc18 -= assign18;
-            totalWithdrawSharesOutstanding18 -= assign18;
-
-            emit PayoutAssignedToBucket(payEpoch, bucketEpoch, assign18, usdAllocated6);
-            steps++;
         }
     }
 
-    // ✅ Added nonReentrant
-    function claimWithdraw(uint256 requestEpoch) external nonReentrant {
-        WithdrawBucket storage b = withdrawBuckets[requestEpoch];
-        UserWithdraw storage u = userWithdraws[requestEpoch][msg.sender];
+    function _updateExposureLimits(uint32 assetId, uint64 lpLocked, uint64 margin, bool isLong, bool increase) internal {
+        Exposure storage e = exposures[assetId];
+        uint128 locked = uint128(lpLocked);
+        uint128 marg = uint128(margin);
 
-        require(u.sharesRequested18 > 0, "no request");
-        require(b.totalSharesInitial18 > 0, "bucket empty");
+        if (isLong) {
+            if (increase) {
+                e.longMaxProfit += locked;
+                e.longMaxLoss += marg;
+            } else {
+                e.longMaxProfit = _safeSub(e.longMaxProfit, locked);
+                e.longMaxLoss = _safeSub(e.longMaxLoss, marg);
+            }
+        } else {
+            if (increase) {
+                e.shortMaxProfit += locked;
+                e.shortMaxLoss += marg;
+            } else {
+                e.shortMaxProfit = _safeSub(e.shortMaxProfit, locked);
+                e.shortMaxLoss = _safeSub(e.shortMaxLoss, marg);
+            }
+        }
+    }
 
-        uint256 totalDue6 = _mulDiv(b.totalUsdAllocated6, u.sharesRequested18, b.totalSharesInitial18);
-        require(totalDue6 > u.usdWithdrawn6, "nothing to claim");
+    // ----------------------------------------------------------------
+    // 5. CALCULS (SPREAD, MARGE, LIQUIDATION, FUNDING)
+    // ----------------------------------------------------------------
 
-        uint256 pay6 = totalDue6 - u.usdWithdrawn6;
-        u.usdWithdrawn6 = totalDue6;
+    function _safeSub(uint128 a, uint128 b) internal pure returns (uint128) {
+        return (b > a) ? 0 : a - b;
+    }
+
+    function _getNotionalValue(uint32 assetId, uint256 price, uint32 lotSize) internal view returns (uint256) {
+        Asset memory a = assets[assetId];
+        return (price * uint256(lotSize) * uint256(a.numerator)) / uint256(a.denominator);
+    }
+
+    function _isRoundLeverage(uint8 lev) internal pure returns (bool) {
+        return (lev == 1 || lev == 2 || lev == 3 || lev == 5 || lev == 10 || lev == 20 || lev == 25 || lev == 50 || lev == 100);
+    }
+
+    function validateStops(uint256 entryPrice, bool isLong, uint256 stopLoss, uint256 takeProfit) public pure returns (bool, string memory) {
+        if (stopLoss == 0 && takeProfit == 0) return (true, "");
+        if (stopLoss != 0 && takeProfit != 0 && stopLoss == takeProfit) return (false, "SL_EQUALS_TP");
+
+        if (isLong) {
+            if (takeProfit > 0 && takeProfit <= entryPrice) return (false, "LONG_TP_TOO_LOW");
+            if (stopLoss > 0 && stopLoss >= entryPrice) return (false, "LONG_SL_TOO_HIGH");
+        } else {
+            if (takeProfit > 0 && takeProfit >= entryPrice) return (false, "SHORT_TP_TOO_HIGH");
+            if (stopLoss > 0 && stopLoss <= entryPrice) return (false, "SHORT_SL_TOO_LOW");
+        }
+        return (true, "");
+    }
+
+    function calculateSpread(uint32 assetId, bool isLong, bool isOpening, uint32 lotSize) public view returns (uint256) {
+        Asset memory a = assets[assetId];
+        Exposure memory e = exposures[assetId];
+        uint256 base = uint256(a.spread);
         
-        bool success = usdc.transfer(msg.sender, pay6);
-        require(success, "Transfer failed");
+        int256 L = int256(e.longLots);
+        int256 S = int256(e.shortLots);
+        int256 size = int256(uint256(lotSize));
 
-        emit WithdrawClaimed(msg.sender, requestEpoch, pay6);
+        if (isLong) { if (isOpening) L += size; else L -= size; } 
+        else { if (isOpening) S += size; else S -= size; }
+        
+        if(L < 0) L = 0; if(S < 0) S = 0;
+
+        uint256 numerator = (L > S) ? uint256(L - S) : uint256(S - L);
+        uint256 denominator = uint256(L + S + 2);
+        
+        if (denominator == 0) return base;
+        
+        uint256 p = ((numerator * 1e18) / denominator) ** 2 / 1e18;
+        bool dominant = (L > S && isLong) || (S > L && !isLong);
+        return dominant ? (base * (1e18 + 3 * p)) / 1e18 : base;
     }
 
-    // -----------------------------
-    // Views
-    // -----------------------------
-    function getLpEpochsCount(address lp) external view returns (uint256) {
-        return epochsWithDeposits[lp].length;
+    function calculateWeekendFunding(uint256 tradeId) public view returns (uint256) {
+        Trade memory t = trades[tradeId];
+        Asset memory a = assets[t.assetId];
+        if (a.weekendFunding == 0) return 0;
+
+        uint256 closeTs = block.timestamp;
+        if (closeTs <= t.openTimestamp) return 0;
+
+        uint256 offset = 259200; 
+        uint256 secondsPerWeek = 604800;
+        uint256 openWeek = (uint256(t.openTimestamp) + offset) / secondsPerWeek;
+        uint256 currentWeek = (closeTs + offset) / secondsPerWeek;
+
+        if (currentWeek <= openWeek) return 0;
+        uint256 weekendsCrossed = currentWeek - openWeek;
+        
+        return weekendsCrossed * uint256(a.weekendFunding) * uint256(uint32(t.lotSize));
     }
 
-    function getLpEpochAt(address lp, uint256 index) external view returns (uint256) {
-        return epochsWithDeposits[lp][index];
+    function calculateMargin6(uint32 assetId, uint256 entryPrice, uint32 lotSize, uint8 leverage) public view returns (uint256) {
+        uint256 notional = _getNotionalValue(assetId, entryPrice, lotSize);
+        return notional / uint256(leverage);
     }
 
-    function computeLpShares(address lp) external view returns (uint256 shares18, uint256 pendingCurrentEpoch6) {
-        uint256[] memory list = epochsWithDeposits[lp];
-        uint256 len = list.length;
-        uint256 s = 0;
-        for (uint256 i = 0; i < len; i++) {
-            uint256 e = list[i];
-            uint256 dep6 = pendingDepositOf[lp][e];
-            if (dep6 == 0) continue;
-            uint256 price = lpTokenPrice[e];
-            if (price == 0) continue;
-            uint256 dep18 = _toWadFrom6(dep6);
-            s += (dep18 * WAD) / price;
+    function calculateLockedCapital(uint32 assetId, uint256 entryPrice, uint32 lotSize, uint8 leverage) public view returns (uint256) {
+        Asset memory a = assets[assetId];
+        uint256 notional = _getNotionalValue(assetId, entryPrice, lotSize);
+        uint256 margin = notional / uint256(leverage);
+        
+        uint256 maxProfitLev = (margin * uint256(a.securityMultiplier)) / 100;
+        uint256 physMoveVal = (entryPrice * uint256(a.maxPhysicalMove)) / 100;
+        uint256 physProfit = _getNotionalValue(assetId, physMoveVal, lotSize);
+        return (maxProfitLev < physProfit) ? maxProfitLev : physProfit;
+    }
+
+    function calculateLiquidationPrice(uint256 tradeId) public view returns (uint256) {
+        Trade memory t = trades[tradeId];
+        Asset memory a = assets[t.assetId];
+        FundingState memory f = fundingStates[t.assetId];
+
+        uint256 openPrice = uint256(t.openPrice);
+        uint256 margin = _getNotionalValue(t.assetId, openPrice, uint32(t.lotSize)) / uint256(t.leverage);
+        uint256 liquidationLoss = (margin * 90) / 100; 
+
+        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(t.lotSize));
+        uint256 spreadCost = _getNotionalValue(t.assetId, spread, uint32(t.lotSize));
+        
+        uint256 currentIdx = t.isLong ? f.longFundingIndex : f.shortFundingIndex;
+        uint256 fundingCost = (uint256(currentIdx) - uint256(t.fundingIndex)) * uint256(uint32(t.lotSize)) * uint256(a.numerator) / uint256(a.denominator);
+        uint256 weekendCost = calculateWeekendFunding(tradeId) * uint256(a.numerator) / uint256(a.denominator);
+
+        uint256 totalLossAllowable = liquidationLoss + spreadCost + fundingCost + weekendCost;
+        uint256 deltaPrice = (totalLossAllowable * uint256(a.denominator)) / (uint256(uint32(t.lotSize)) * uint256(a.numerator));
+
+        if (t.isLong) {
+            return (deltaPrice >= openPrice) ? 0 : openPrice - deltaPrice;
+        } else {
+            return openPrice + deltaPrice;
         }
-        shares18 = s;
-        pendingCurrentEpoch6 = pendingDepositOf[lp][currentEpoch];
     }
 
-    function getLpSharesForEpoch(address lp, uint256 e) external view returns (uint256 shares18) {
-        uint256 dep6 = pendingDepositOf[lp][e];
-        if (dep6 == 0) return 0;
-        uint256 price = lpTokenPrice[e];
-        if (price == 0) return 0;
-        uint256 dep18 = _toWadFrom6(dep6);
-        return (dep18 * WAD) / price;
+    // ----------------------------------------------------------------
+    // 6. FUNDING RATE
+    // ----------------------------------------------------------------
+
+    function updateFundingRates(uint32[] calldata assetIds) external {
+        for (uint256 i = 0; i < assetIds.length; i++) {
+            _updateFundingRate(assetIds[i]);
+        }
     }
 
-    function getWithdrawEpochsCount(address lp) external view returns (uint256) {
-        return withdrawEpochsOf[lp].length;
+    function _updateFundingRate(uint32 assetId) internal {
+        FundingState storage f = fundingStates[assetId];
+        if (block.timestamp < f.lastUpdate + 1 hours) return;
+
+        Exposure memory e = exposures[assetId];
+        Asset memory a = assets[assetId];
+
+        uint256 L = uint256(int256(e.longLots) > 0 ? uint256(int256(e.longLots)) : 0);
+        uint256 S = uint256(int256(e.shortLots) > 0 ? uint256(int256(e.shortLots)) : 0);
+        uint256 baseFunding = uint256(a.baseFundingRate);
+
+        (uint256 longRate, uint256 shortRate) = _computeFundingRateQuadratic(L, S, baseFunding);
+
+        f.longFundingIndex += uint128(longRate);
+        f.shortFundingIndex += uint128(shortRate);
+        f.lastUpdate = uint64(block.timestamp);
     }
 
-    function getWithdrawEpochAt(address lp, uint256 index) external view returns (uint256) {
-        return withdrawEpochsOf[lp][index];
+    function _computeFundingRateQuadratic(uint256 L, uint256 S, uint256 baseFunding) internal pure returns (uint256 longRate, uint256 shortRate) {
+        if (L == S) return (baseFunding, baseFunding);
+        uint256 numerator = (L > S) ? (L - S) : (S - L);
+        uint256 denominator = L + S + 2;
+        uint256 r = (numerator * 1e18) / denominator;
+        uint256 p = (r * r) / 1e18;
+        uint256 dominantRate = (baseFunding * (1e18 + 3 * p)) / 1e18;
+        if (L > S) return (dominantRate, baseFunding);
+        else return (baseFunding, dominantRate);
     }
 
-    function getClaimableNow(address lp, uint256 requestEpoch) external view returns (uint256 claimable6) {
-        WithdrawBucket storage b = withdrawBuckets[requestEpoch];
-        UserWithdraw storage u = userWithdraws[requestEpoch][lp];
-        if (u.sharesRequested18 == 0 || b.totalSharesInitial18 == 0) return 0;
-        uint256 totalDue6 = _mulDiv(b.totalUsdAllocated6, u.sharesRequested18, b.totalSharesInitial18);
-        if (totalDue6 <= u.usdWithdrawn6) return 0;
-        return totalDue6 - u.usdWithdrawn6;
+    // ----------------------------------------------------------------
+    // 7. TRADING FUNCTIONS (ORACLE PROTECTED)
+    // ----------------------------------------------------------------
+
+    function openMarketPosition(uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 stopLoss, uint48 takeProfit, bytes calldata oracleProof) external {
+        require(assets[assetId].listed, "ASSET_DELETED");
+        require(assets[assetId].allowOpen, "CLOSE_ONLY_MODE"); 
+        require(lotSize > 0, "BAD_SIZE");
+        require(_isRoundLeverage(leverage), "BAD_LEV");
+
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, assetId);
+
+        uint256 spread = calculateSpread(assetId, isLong, true, uint32(lotSize));
+        uint256 entryPrice = isLong ? price1e6 + spread : price1e6 - spread;
+
+        (bool stopsOk, string memory reason) = validateStops(entryPrice, isLong, stopLoss, takeProfit);
+        require(stopsOk, reason);
+
+        uint256 margin6 = calculateMargin6(assetId, entryPrice, uint32(lotSize), leverage);
+        uint256 lpLocked6 = calculateLockedCapital(assetId, entryPrice, uint32(lotSize), leverage);
+        uint256 commission6 = (margin6 * assets[assetId].commission) / 10000;
+
+        uint256 tradeId = ++nextTradeID;
+        Trade storage t = trades[tradeId];
+        
+        t.trader = msg.sender; t.assetId = assetId; t.isLong = isLong; t.leverage = leverage;
+        t.openPrice = uint48(entryPrice); t.state = 1; t.openTimestamp = uint32(block.timestamp);
+        
+        FundingState memory fs = fundingStates[assetId];
+        t.fundingIndex = isLong ? fs.longFundingIndex : fs.shortFundingIndex;
+        
+        t.lotSize = lotSize; t.stopLoss = stopLoss; t.takeProfit = takeProfit;
+        t.lpLockedCapital = uint64(lpLocked6); t.marginUsdc = uint64(margin6);
+
+        _updateExposure(assetId, lotSize, uint48(entryPrice), isLong, true);
+        _updateExposureLimits(assetId, uint64(lpLocked6), uint64(margin6), isLong, true);
+
+        brokexVault.createPosition(tradeId, msg.sender, margin6, commission6, lpLocked6);
+        emit TradeEvent(tradeId, 1);
     }
 
-    function getTraderTotalBalance(address trader) external view returns (uint256 total6) {
-        return freeBalance[trader] + lockedBalance[trader];
+    function placeOrder(uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external {
+        require(assets[assetId].listed, "ASSET_DELETED");
+        require(assets[assetId].allowOpen, "CLOSE_ONLY_MODE"); 
+        
+        (bool stopsOk, string memory reason) = validateStops(uint256(targetPrice), isLong, stopLoss, takeProfit);
+        require(stopsOk, reason);
+
+        uint256 margin6 = calculateMargin6(assetId, uint256(targetPrice), uint32(lotSize), leverage);
+        uint256 lpLocked6 = calculateLockedCapital(assetId, uint256(targetPrice), uint32(lotSize), leverage);
+        uint256 commission6 = (margin6 * assets[assetId].commission) / 10000;
+
+        uint256 tradeId = ++nextTradeID;
+        trades[tradeId] = Trade({trader: msg.sender, assetId: assetId, isLong: isLong, leverage: leverage, openPrice: targetPrice, state: 0, openTimestamp: uint32(block.timestamp), fundingIndex: 0, closePrice: 0, lotSize: lotSize, stopLoss: stopLoss, takeProfit: takeProfit, lpLockedCapital: uint64(lpLocked6), marginUsdc: uint64(margin6)});
+        brokexVault.createOrder(tradeId, msg.sender, margin6, commission6, lpLocked6);
+        emit TradeEvent(tradeId, 0);
     }
 
-    function getLpTotalCapital6() external view returns (uint256 total6) {
-        return lpFreeCapital + lpLockedCapital;
+    function executeOrder(uint256 tradeId, bytes calldata oracleProof) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 0, "NOT_PENDING");
+        require(assets[t.assetId].allowOpen, "CLOSE_ONLY_MODE");
+
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+
+        bool executable = t.isLong ? price1e6 <= uint256(t.openPrice) : price1e6 >= uint256(t.openPrice);
+        require(executable, "PRICE_BAD");
+
+        uint256 spread = calculateSpread(t.assetId, t.isLong, true, uint32(t.lotSize));
+        uint256 execPrice = t.isLong ? price1e6 + spread : price1e6 - spread;
+
+        t.openPrice = uint48(execPrice); t.state = 1; t.openTimestamp = uint32(block.timestamp);
+        
+        FundingState memory fs = fundingStates[t.assetId];
+        t.fundingIndex = t.isLong ? fs.longFundingIndex : fs.shortFundingIndex;
+
+        _updateExposure(t.assetId, t.lotSize, uint48(execPrice), t.isLong, true);
+        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, true);
+
+        brokexVault.executeOrder(tradeId);
+        emit TradeEvent(tradeId, 1);
     }
 
-    function getLpTotalCapital18() external view returns (uint256 total18) {
-        return _toWadFrom6(lpFreeCapital + lpLockedCapital);
+    function closePositionMarket(uint256 tradeId, bytes calldata oracleProof) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 1, "NOT_OPEN");
+        require(msg.sender == t.trader, "NOT_YOUR_TRADE");
+        
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+        _finalizeClose(t, price1e6, tradeId);
+    }
+
+    function liquidatePosition(uint256 tradeId, bytes calldata oracleProof) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 1, "NOT_OPEN");
+
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+        uint256 liqPrice = calculateLiquidationPrice(tradeId);
+        
+        bool isLiq = t.isLong ? price1e6 <= liqPrice : price1e6 >= liqPrice;
+        require(isLiq, "NOT_LIQ");
+
+        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
+        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, false);
+
+        t.state = 2; t.closePrice = uint48(price1e6);
+        brokexVault.liquidate(tradeId);
+        emit TradeEvent(tradeId, 4);
+    }
+
+    function executeStopOrTakeProfit(uint256 tradeId, bytes calldata oracleProof) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 1, "NOT_OPEN");
+
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+        bool triggered = false;
+        if (t.stopLoss > 0) {
+            if (t.isLong && price1e6 <= t.stopLoss) triggered = true;
+            if (!t.isLong && price1e6 >= t.stopLoss) triggered = true;
+        }
+        if (!triggered && t.takeProfit > 0) {
+            if (t.isLong && price1e6 >= t.takeProfit) triggered = true;
+            if (!t.isLong && price1e6 <= t.takeProfit) triggered = true;
+        }
+        require(triggered, "NOT_TRIGGERED");
+        _finalizeClose(t, price1e6, tradeId);
+    }
+
+    function updateSLTP(uint256 tradeId, uint48 newSL, uint48 newTP) external {
+        Trade storage t = trades[tradeId];
+        require(msg.sender == t.trader, "NOT_OWNER");
+        require(t.state <= 1, "CLOSED");
+        (bool ok, string memory reason) = validateStops(uint256(t.openPrice), t.isLong, newSL, newTP);
+        require(ok, reason);
+        t.stopLoss = newSL; t.takeProfit = newTP;
+    }
+
+    function cancelOrder(uint256 tradeId) external {
+        Trade storage t = trades[tradeId];
+        require(t.state == 0, "NOT_PENDING");
+        t.state = 3;
+        brokexVault.cancelOrder(tradeId);
+        emit TradeEvent(tradeId, 3);
+    }
+
+    function _finalizeClose(Trade storage t, uint256 price1e6, uint256 tradeId) internal {
+        int256 netPnl = _calculateNetPnl(t, price1e6, tradeId);
+        _updateExposure(t.assetId, t.lotSize, t.openPrice, t.isLong, false);
+        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, false);
+        t.state = 2; t.closePrice = uint48(price1e6);
+        brokexVault.closeTrade(tradeId, netPnl);
+        emit TradeEvent(tradeId, 2);
+    }
+
+    function _calculateNetPnl(Trade storage t, uint256 price1e6, uint256 tradeId) internal view returns (int256) {
+        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(t.lotSize));
+        uint256 exitPrice;
+        if (t.isLong) {
+            if (spread > price1e6) exitPrice = 0; else exitPrice = price1e6 - spread;
+        } else {
+            exitPrice = price1e6 + spread;
+        }
+
+        int256 delta = t.isLong ? int256(exitPrice) - int256(uint256(t.openPrice)) : int256(uint256(t.openPrice)) - int256(exitPrice);
+        Asset memory a = assets[t.assetId];
+        int256 lotSize256 = int256(uint256(uint32(t.lotSize)));
+        int256 rawPnl = (delta * lotSize256 * int256(uint256(a.numerator))) / int256(uint256(a.denominator));
+        
+        FundingState memory fs = fundingStates[t.assetId];
+        uint256 currentIdx = t.isLong ? fs.longFundingIndex : fs.shortFundingIndex;
+        uint256 fundingPaid = (uint256(currentIdx) - uint256(t.fundingIndex)) * uint256(uint32(t.lotSize)) * uint256(a.numerator) / uint256(a.denominator);
+        uint256 weekendFees = calculateWeekendFunding(tradeId) * uint256(a.numerator) / uint256(a.denominator);
+
+        return (rawPnl * 1e12) - int256(fundingPaid + weekendFees) * 1e12;
+    }
+
+    // ----------------------------------------------------------------
+    // 8. UNREALIZED PNL (ORACLE INTEGRATED)
+    // ----------------------------------------------------------------
+
+    function updateUnrealizedPnl(bytes[] calldata oracleProofs, uint32[] calldata assetIds) external returns (uint64 runId, bool runCompleted, int256 currentPnl) {
+        require(oracleProofs.length == assetIds.length, "MISMATCH");
+        
+        PnlRun storage run;
+        if (currentPnlRunId == 0 || block.timestamp > pnlRuns[currentPnlRunId].startTimestamp + 2 minutes || pnlRuns[currentPnlRunId].completed) {
+            currentPnlRunId++;
+            run = pnlRuns[currentPnlRunId];
+            run.runId = currentPnlRunId;
+            run.startTimestamp = uint64(block.timestamp);
+            run.totalAssetsAtStart = uint32(listedAssetsCount);
+            pnlCalculationActive = true;
+            emit PnlRunStarted(currentPnlRunId, uint32(listedAssetsCount));
+        } else {
+            run = pnlRuns[currentPnlRunId];
+        }
+
+        if (block.timestamp > run.startTimestamp + 2 minutes) {
+            emit PnlRunExpired(currentPnlRunId);
+            return (currentPnlRunId, false, run.cumulativePnlX6);
+        }
+
+        for (uint256 i = 0; i < oracleProofs.length; i++) {
+            uint32 assetId = assetIds[i];
+            if(!assets[assetId].listed) continue; // Skip deleted assets
+            if (assetProcessedInRun[currentPnlRunId][assetId]) continue;
+
+            uint256 price1e6 = _getVerifiedPrice(oracleProofs[i], assetId);
+            int256 assetPnl = _calculateAssetPnlCapped(assetId, price1e6);
+            
+            run.cumulativePnlX6 += assetPnl;
+            assetProcessedInRun[currentPnlRunId][assetId] = true;
+            run.assetsProcessed++;
+        }
+
+        if (run.assetsProcessed >= run.totalAssetsAtStart) {
+            run.completed = true;
+            run.endTimestamp = uint64(block.timestamp);
+            pnlCalculationActive = false;
+            emit PnlRunCompleted(currentPnlRunId, run.cumulativePnlX6);
+        }
+        return (currentPnlRunId, run.completed, run.cumulativePnlX6);
+    }
+
+    function _calculateAssetPnlCapped(uint32 assetId, uint256 currentPrice1e6) internal view returns (int256 pnlX6) {
+        Exposure memory e = exposures[assetId];
+        Asset memory a = assets[assetId];
+        
+        if (e.longLots == 0 && e.shortLots == 0) return 0;
+
+        int256 longPnl = 0;
+        if (e.longLots > 0) {
+            uint256 currentVal = (currentPrice1e6 * uint256(uint256(int256(e.longLots))) * uint256(a.numerator)) / uint256(a.denominator);
+            uint256 entryVal = uint256(e.longValueSum);
+            longPnl = int256(currentVal) - int256(entryVal);
+
+            if (longPnl > 0) {
+                if (uint256(longPnl) > uint256(e.longMaxProfit)) longPnl = int256(uint256(e.longMaxProfit));
+            } else {
+                if (uint256(-longPnl) > uint256(e.longMaxLoss)) longPnl = -int256(uint256(e.longMaxLoss));
+            }
+        }
+
+        int256 shortPnl = 0;
+        if (e.shortLots > 0) {
+            uint256 currentVal = (currentPrice1e6 * uint256(uint256(int256(e.shortLots))) * uint256(a.numerator)) / uint256(a.denominator);
+            uint256 entryVal = uint256(e.shortValueSum);
+            shortPnl = int256(entryVal) - int256(currentVal);
+
+            if (shortPnl > 0) {
+                if (uint256(shortPnl) > uint256(e.shortMaxProfit)) shortPnl = int256(uint256(e.shortMaxProfit));
+            } else {
+                if (uint256(-shortPnl) > uint256(e.shortMaxLoss)) shortPnl = -int256(uint256(e.shortMaxLoss));
+            }
+        }
+        return -(longPnl + shortPnl);
+    }
+
+    // ----------------------------------------------------------------
+    // 9. VIEWS UTILS
+    // ----------------------------------------------------------------
+
+    function getExposureAndAveragePrices(uint32 assetId) public view returns (uint32 longLots, uint32 shortLots, uint256 avgLongPrice, uint256 avgShortPrice) {
+        Exposure memory e = exposures[assetId];
+        longLots = uint32(e.longLots);
+        shortLots = uint32(e.shortLots);
+        if (e.longLots > 0) avgLongPrice = uint256(e.longValueSum) / uint256(uint32(e.longLots));
+        if (e.shortLots > 0) avgShortPrice = uint256(e.shortValueSum) / uint256(uint32(e.shortLots));
+    }
+
+    function getAssetRiskLimits(uint32 assetId) external view returns (uint32 maxLong, uint32 maxShort, uint32 oracleDelay, bool isOpenAllowed) {
+        Asset memory a = assets[assetId];
+        return (a.maxLongLots, a.maxShortLots, a.maxOracleDelay, a.allowOpen);
+    }
+
+    function getLastFinishedPnlRun() external view returns (int256 pnl, uint64 timestamp) {
+        if (currentPnlRunId > 0) {
+            PnlRun memory run = pnlRuns[currentPnlRunId];
+            if (run.completed) return (run.cumulativePnlX6, run.endTimestamp);
+            else if (currentPnlRunId > 1) {
+                PnlRun memory prev = pnlRuns[currentPnlRunId - 1];
+                if (prev.completed) return (prev.cumulativePnlX6, prev.endTimestamp);
+            }
+        }
+        return (0, 0);
     }
 }
