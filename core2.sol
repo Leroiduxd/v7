@@ -2,10 +2,10 @@
 pragma solidity ^0.8.19;
 
 /*
-    BROKEX CORE V17 (FINAL SECURITY HARDCAP)
+    BROKEX CORE V16 (ADAPTIVE ORACLE DELAY)
     - Logic: Full Trading Engine (V15 Base)
-    - Feature: Per-Asset Oracle Freshness
-    - Security: Hardcapped Oracle Delay (Min 15s - Max 90s)
+    - Feature: Per-Asset Oracle Freshness (maxOracleDelay)
+    - Feature: Owner can update delay (Min 15s, Max 3600s)
     - Oracle: SupraOracles V2 Integration
 */
 
@@ -173,7 +173,7 @@ contract BrokexCore {
         
         // ✅ ADAPTIVE DELAY CHECK
         uint256 allowedDelay = uint256(assets[_assetId].maxOracleDelay);
-        if (allowedDelay == 0) allowedDelay = 60; // Fallback default if not set
+        if (allowedDelay == 0) allowedDelay = 60; // Fallback default
         
         require(block.timestamp - oracleTime <= allowedDelay, "STALE_PRICE");
 
@@ -208,18 +208,18 @@ contract BrokexCore {
             maxPhysicalMove: maxPhysicalMove, maxLeverage: maxLeverage, 
             maxLongLots: 1000000, 
             maxShortLots: 1000000, 
-            maxOracleDelay: 60, // Default 60s
+            maxOracleDelay: 60, // ✅ Default 60s
             allowOpen: true,
             listed: true
         });
         listedAssetsCount++;
     }
 
-    // ✅ UPDATE: Hardcapped to 90s max
+    // ✅ NEW: Update Oracle Delay Per Asset
     function setAssetOracleDelay(uint32 assetId, uint32 newDelay) external onlyOwner {
         require(assets[assetId].listed, "UNKNOWN_ASSET");
-        require(newDelay >= 15, "DELAY_TOO_SHORT"); // Minimum 15s
-        require(newDelay <= 90, "DELAY_TOO_LONG");  // Maximum 90s
+        require(newDelay >= 15, "DELAY_TOO_SHORT"); // Min security
+        require(newDelay <= 90, "DELAY_TOO_LONG"); // Max 1h
         assets[assetId].maxOracleDelay = newDelay;
     }
 
