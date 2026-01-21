@@ -2,11 +2,10 @@
 pragma solidity ^0.8.19;
 
 /*
-    BROKEX CORE V16 (ADAPTIVE ORACLE DELAY)
-    - Logic: Full Trading Engine (V15 Base)
-    - Feature: Per-Asset Oracle Freshness (maxOracleDelay)
-    - Feature: Owner can update delay (Min 15s, Max 3600s)
-    - Oracle: SupraOracles V2 Integration
+    BROKEX CORE V18 (BATCH PRICE UPDATE OPTIMIZED)
+    - Fix: updateUnrealizedPnl now accepts ONE proof for MULTIPLE assets.
+    - Gas Optimization: Proof decoded once, prices extracted in loop.
+    - Security: All previous V17 checks maintained (Oracle Delay Hardcap).
 */
 
 // ==========================================
@@ -43,7 +42,7 @@ contract BrokexCore {
     // ----------------------------------------------------------------
 
     uint256 constant SECONDS_PER_WEEK = 604800;
-    uint256 constant OFFSET_TO_MONDAY = 259200; // 3 jours * 86400 (Jeudi -> Lundi)
+    uint256 constant OFFSET_TO_MONDAY = 259200; 
 
     ISupraOraclePull public immutable oracle;
     IBrokexVault public brokexVault;
@@ -58,7 +57,7 @@ contract BrokexCore {
         bool isLong;
         uint8 leverage;
         uint48 openPrice;      
-        uint8 state; // 0=Order, 1=Open, 2=Closed, 3=Cancelled
+        uint8 state; 
         uint32 openTimestamp;
         uint128 fundingIndex;
         uint48 closePrice;     
@@ -80,10 +79,10 @@ contract BrokexCore {
         uint16 securityMultiplier;
         uint16 maxPhysicalMove;
         uint8  maxLeverage;
-        uint32 maxLongLots;     // RISK: Max Long Exposure
-        uint32 maxShortLots;    // RISK: Max Short Exposure
-        uint32 maxOracleDelay;  // ✅ NEW: Specific Oracle freshness (seconds)
-        bool allowOpen;         // Trade allowed?
+        uint32 maxLongLots;     
+        uint32 maxShortLots;    
+        uint32 maxOracleDelay;  
+        bool allowOpen;         
         bool listed;
     }
 
@@ -119,7 +118,6 @@ contract BrokexCore {
     mapping(uint32 => Exposure) public exposures;
     mapping(uint32 => FundingState) public fundingStates;
     
-    // PnL State
     uint64 public currentPnlRunId;
     mapping(uint64 => PnlRun) public pnlRuns;
     mapping(uint64 => mapping(uint32 => bool)) public assetProcessedInRun;
@@ -143,12 +141,11 @@ contract BrokexCore {
     }
 
     // ----------------------------------------------------------------
-    // 2. ORACLE HELPER (ADAPTIVE DELAY)
+    // 2. ORACLE HELPER (INTERNAL LOGIC)
     // ----------------------------------------------------------------
 
-    function _getVerifiedPrice(bytes calldata _bytesProof, uint32 _assetId) internal returns (uint256 price1e6) {
-        ISupraOraclePull.PriceInfo memory info = oracle.verifyOracleProofV2(_bytesProof);
-        
+    // Extrait le prix normalisé depuis une structure PriceInfo déjà décodée
+    function _extractPriceFromInfo(ISupraOraclePull.PriceInfo memory info, uint32 _assetId) internal view returns (uint256 price1e6) {
         uint256 len = info.pairs.length;
         bool found = false;
         uint256 index;
@@ -163,7 +160,6 @@ contract BrokexCore {
         
         require(found, "PAIR_NOT_IN_PROOF");
         
-        // CORRECTION TIMESTAMP (MS -> SEC)
         uint256 oracleTime = info.timestamp[index];
         if (oracleTime > 1000000000000) {
             oracleTime = oracleTime / 1000;
@@ -171,9 +167,8 @@ contract BrokexCore {
 
         require(block.timestamp >= oracleTime, "FUTURE_PROOF");
         
-        // ✅ ADAPTIVE DELAY CHECK
         uint256 allowedDelay = uint256(assets[_assetId].maxOracleDelay);
-        if (allowedDelay == 0) allowedDelay = 60; // Fallback default
+        if (allowedDelay == 0) allowedDelay = 60; 
         
         require(block.timestamp - oracleTime <= allowedDelay, "STALE_PRICE");
 
@@ -187,6 +182,12 @@ contract BrokexCore {
         } else {
             price1e6 = rawPrice;
         }
+    }
+
+    // Wrapper pour les appels uniques (Trading)
+    function _getVerifiedPrice(bytes calldata _bytesProof, uint32 _assetId) internal returns (uint256) {
+        ISupraOraclePull.PriceInfo memory info = oracle.verifyOracleProofV2(_bytesProof);
+        return _extractPriceFromInfo(info, _assetId);
     }
 
     // ----------------------------------------------------------------
@@ -208,18 +209,17 @@ contract BrokexCore {
             maxPhysicalMove: maxPhysicalMove, maxLeverage: maxLeverage, 
             maxLongLots: 1000000, 
             maxShortLots: 1000000, 
-            maxOracleDelay: 60, // ✅ Default 60s
+            maxOracleDelay: 60, 
             allowOpen: true,
             listed: true
         });
         listedAssetsCount++;
     }
 
-    // ✅ NEW: Update Oracle Delay Per Asset
     function setAssetOracleDelay(uint32 assetId, uint32 newDelay) external onlyOwner {
         require(assets[assetId].listed, "UNKNOWN_ASSET");
-        require(newDelay >= 15, "DELAY_TOO_SHORT"); // Min security
-        require(newDelay <= 90, "DELAY_TOO_LONG"); // Max 1h
+        require(newDelay >= 15, "DELAY_TOO_SHORT");
+        require(newDelay <= 90, "DELAY_TOO_LONG");
         assets[assetId].maxOracleDelay = newDelay;
     }
 
@@ -259,7 +259,6 @@ contract BrokexCore {
 
         if (isLong) {
             if (increase) {
-                // RISK CHECK: Max Long Limit
                 require(uint256(uint256(int256(e.longLots))) + uint256(uint32(lotSize)) <= uint256(assets[assetId].maxLongLots), "MAX_LONG_LIMIT");
                 e.longLots += lotSize;
                 e.longValueSum += value;
@@ -269,7 +268,6 @@ contract BrokexCore {
             }
         } else {
             if (increase) {
-                // RISK CHECK: Max Short Limit
                 require(uint256(uint256(int256(e.shortLots))) + uint256(uint32(lotSize)) <= uint256(assets[assetId].maxShortLots), "MAX_SHORT_LIMIT");
                 e.shortLots += lotSize;
                 e.shortValueSum += value;
@@ -636,12 +634,15 @@ contract BrokexCore {
     }
 
     // ----------------------------------------------------------------
-    // 8. UNREALIZED PNL (ORACLE INTEGRATED)
+    // 8. UNREALIZED PNL (BATCH OPTIMIZED)
     // ----------------------------------------------------------------
 
-    function updateUnrealizedPnl(bytes[] calldata oracleProofs, uint32[] calldata assetIds) external returns (uint64 runId, bool runCompleted, int256 currentPnl) {
-        require(oracleProofs.length == assetIds.length, "MISMATCH");
+    // ✅ MODIFIED: Accepts ONE proof for MULTIPLE assets to save gas
+    function updateUnrealizedPnl(bytes calldata singleProof, uint32[] calldata assetIds) external returns (uint64 runId, bool runCompleted, int256 currentPnl) {
         
+        // 1. Verify and Decode proof ONCE
+        ISupraOraclePull.PriceInfo memory info = oracle.verifyOracleProofV2(singleProof);
+
         PnlRun storage run;
         if (currentPnlRunId == 0 || block.timestamp > pnlRuns[currentPnlRunId].startTimestamp + 2 minutes || pnlRuns[currentPnlRunId].completed) {
             currentPnlRunId++;
@@ -660,12 +661,14 @@ contract BrokexCore {
             return (currentPnlRunId, false, run.cumulativePnlX6);
         }
 
-        for (uint256 i = 0; i < oracleProofs.length; i++) {
+        // 2. Loop through requested assets and extract price from the decoded info
+        for (uint256 i = 0; i < assetIds.length; i++) {
             uint32 assetId = assetIds[i];
-            if(!assets[assetId].listed) continue; // Skip deleted assets
+            if(!assets[assetId].listed) continue; 
             if (assetProcessedInRun[currentPnlRunId][assetId]) continue;
 
-            uint256 price1e6 = _getVerifiedPrice(oracleProofs[i], assetId);
+            // Extract price from the already decoded proof
+            uint256 price1e6 = _extractPriceFromInfo(info, assetId);
             int256 assetPnl = _calculateAssetPnlCapped(assetId, price1e6);
             
             run.cumulativePnlX6 += assetPnl;
