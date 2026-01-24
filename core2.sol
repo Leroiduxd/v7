@@ -728,6 +728,7 @@ contract BrokexCore {
         (bool ok, string memory reason) = validateStops(uint256(t.openPrice), t.isLong, newSL, newTP);
         if (!ok) revert(reason);
         t.stopLoss = newSL; t.takeProfit = newTP;
+        emit TradeEvent(tradeId, 5);
     }
 
     function _cancelOrder(uint256 tradeId) internal {
