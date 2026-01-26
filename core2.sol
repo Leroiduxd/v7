@@ -2,9 +2,12 @@
 pragma solidity ^0.8.19;
 
 /*
-    BROKEX CORE V21 (OPTIMIZED - SIZE FIX)
-    - Logic: Identical to previous V21.
-    - Optimization: Replaced string requires with Custom Errors to fix "Contract Limit" warning.
+    BROKEX CORE V22 (LIMIT & STOP ORDERS)
+    - Logic: Full V21 Base (Airdrop, Paymaster, Oracle Batch).
+    - Feature: Added 'isLimit' flag to Orders.
+    - Execution: 
+        * Limit: Buy Low / Sell High (Reversal)
+        * Stop: Buy High / Sell Low (Breakout)
 */
 
 // ==========================================
@@ -104,6 +107,7 @@ contract BrokexCore {
         address trader;
         uint32 assetId;
         bool isLong;
+        bool isLimit; // ✅ NOUVEAU CHAMP (True=Limit, False=Stop)
         uint8 leverage;
         uint48 openPrice;      
         uint8 state; 
@@ -192,6 +196,12 @@ contract BrokexCore {
     }
 
     function setPaymaster(address _paymaster) external onlyOwner {
+        // Sécurité : On ne peut définir le paymaster que s'il n'est pas encore défini (adresse 0)
+        require(paymaster == address(0), "PAYMASTER_ALREADY_SET");
+        
+        // Sécurité : On empêche de mettre une adresse vide
+        if (_paymaster == address(0)) revert ZeroAddr();
+        
         paymaster = _paymaster;
     }
 
@@ -535,8 +545,9 @@ contract BrokexCore {
         _openMarketPosition(msg.sender, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
-    function placeOrder(uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external {
-        _placeOrder(msg.sender, assetId, isLong, leverage, lotSize, targetPrice, stopLoss, takeProfit);
+    // ✅ MODIFIÉ: Ajout de isLimit
+    function placeOrder(uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external {
+        _placeOrder(msg.sender, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
     function executeOrder(uint256 tradeId, bytes calldata oracleProof) external {
@@ -577,8 +588,9 @@ contract BrokexCore {
         _openMarketPosition(trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
-    function placeOrderFor(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external onlyPaymaster {
-        _placeOrder(trader, assetId, isLong, leverage, lotSize, targetPrice, stopLoss, takeProfit);
+    // ✅ MODIFIÉ: Ajout de isLimit
+    function placeOrderFor(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external onlyPaymaster {
+        _placeOrder(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
     function executeOrderFor(uint256 tradeId, bytes calldata oracleProof) external onlyPaymaster {
@@ -618,8 +630,6 @@ contract BrokexCore {
         uint256 entryPrice = isLong ? price1e6 + spread : price1e6 - spread;
 
         (bool stopsOk, string memory reason) = validateStops(entryPrice, isLong, stopLoss, takeProfit);
-        // Custom error conversion for validStops requires complexity, keeping string here or map manually.
-        // For max optimization, we assume front-end checks stops. But let's revert with string for safety or simple error.
         if(!stopsOk) revert(reason);
 
         uint256 margin6 = calculateMargin6(assetId, entryPrice, uint32(lotSize), leverage);
@@ -628,8 +638,8 @@ contract BrokexCore {
 
         uint256 tradeId = ++nextTradeID;
         Trade storage t = trades[tradeId];
-        t.trader = trader; t.assetId = assetId; t.isLong = isLong; t.leverage = leverage;
-        t.openPrice = uint48(entryPrice); t.state = 1; t.openTimestamp = uint32(block.timestamp);
+        t.trader = trader; t.assetId = assetId; t.isLong = isLong; t.isLimit = false; // Market trade n'est pas limit
+        t.leverage = leverage; t.openPrice = uint48(entryPrice); t.state = 1; t.openTimestamp = uint32(block.timestamp);
         FundingState memory fs = fundingStates[assetId];
         t.fundingIndex = isLong ? fs.longFundingIndex : fs.shortFundingIndex;
         t.lotSize = lotSize; t.stopLoss = stopLoss; t.takeProfit = takeProfit;
@@ -643,7 +653,8 @@ contract BrokexCore {
         emit TradeEvent(tradeId, 1);
     }
 
-    function _placeOrder(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) internal {
+    // ✅ MODIFIÉ: isLimit ajouté
+    function _placeOrder(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) internal {
         if (!assets[assetId].listed) revert AssetDeleted();
         if (!assets[assetId].allowOpen) revert CloseOnlyMode();
         (bool stopsOk, string memory reason) = validateStops(uint256(targetPrice), isLong, stopLoss, takeProfit);
@@ -654,21 +665,33 @@ contract BrokexCore {
         uint256 commission6 = (margin6 * assets[assetId].commission) / 10000;
 
         uint256 tradeId = ++nextTradeID;
-        trades[tradeId] = Trade({trader: trader, assetId: assetId, isLong: isLong, leverage: leverage, openPrice: targetPrice, state: 0, openTimestamp: uint32(block.timestamp), fundingIndex: 0, closePrice: 0, lotSize: lotSize, stopLoss: stopLoss, takeProfit: takeProfit, lpLockedCapital: uint64(lpLocked6), marginUsdc: uint64(margin6)});
+        // ✅ On stocke isLimit
+        trades[tradeId] = Trade({trader: trader, assetId: assetId, isLong: isLong, isLimit: isLimit, leverage: leverage, openPrice: targetPrice, state: 0, openTimestamp: uint32(block.timestamp), fundingIndex: 0, closePrice: 0, lotSize: lotSize, stopLoss: stopLoss, takeProfit: takeProfit, lpLockedCapital: uint64(lpLocked6), marginUsdc: uint64(margin6)});
         brokexVault.createOrder(tradeId, trader, margin6, commission6, lpLocked6);
         emit TradeEvent(tradeId, 0);
     }
 
+    // ✅ MODIFIÉ: Logique Limit vs Stop
     function _executeOrder(uint256 tradeId, bytes calldata oracleProof) internal {
         Trade storage t = trades[tradeId];
         if (t.state != 0) revert NotPending();
         if (!assets[t.assetId].allowOpen) revert CloseOnlyMode();
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
-        bool executable = t.isLong ? price1e6 <= uint256(t.openPrice) : price1e6 >= uint256(t.openPrice);
+        
+        bool executable;
+        if (t.isLimit) {
+            // Limit: Acheter plus bas ou Vendre plus haut
+            executable = t.isLong ? price1e6 <= uint256(t.openPrice) : price1e6 >= uint256(t.openPrice);
+        } else {
+            // Stop: Acheter sur breakout (plus haut) ou Vendre sur breakdown (plus bas)
+            executable = t.isLong ? price1e6 >= uint256(t.openPrice) : price1e6 <= uint256(t.openPrice);
+        }
+        
         if (!executable) revert PriceBad();
 
         uint256 spread = calculateSpread(t.assetId, t.isLong, true, uint32(t.lotSize));
+        // Execution price: le prix actuel + spread
         uint256 execPrice = t.isLong ? price1e6 + spread : price1e6 - spread;
 
         t.openPrice = uint48(execPrice); t.state = 1; t.openTimestamp = uint32(block.timestamp);
