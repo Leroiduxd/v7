@@ -9,31 +9,35 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 interface IBrokexCore {
     function openMarketPositionFor(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 stopLoss, uint48 takeProfit, bytes calldata oracleProof) external;
-    function placeOrderFor(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external;
+    
+    // ✅ MODIFIÉ : Ajout de bool isLimit
+    function placeOrderFor(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external;
+    
     function closePositionMarketFor(address trader, uint256 tradeId, bytes calldata oracleProof) external;
     function updateSLTPFor(address trader, uint256 tradeId, uint48 newSL, uint48 newTP) external;
     function cancelOrderFor(address trader, uint256 tradeId) external;
 }
 
-/* ────────────────────────── Brokex Paymaster V2 ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V3 ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
 
     IBrokexCore public immutable core;
-    uint256 public immutable CHAIN_ID; // ✅ Chain ID fixé au déploiement
-    bytes32 public immutable DOMAIN_SEPARATOR; // ✅ Calculé une seule fois
+    uint256 public immutable CHAIN_ID; 
+    bytes32 public immutable DOMAIN_SEPARATOR; 
     
     mapping(address => uint256) public nonces;
 
-    // ───────────── TypeHashes (SANS Proof) ─────────────
+    // ───────────── TypeHashes ─────────────
 
     bytes32 private constant OPEN_MARKET_TYPEHASH = keccak256(
         "OpenMarket(address trader,uint32 assetId,bool isLong,uint8 leverage,int32 lotSize,uint48 stopLoss,uint48 takeProfit,uint256 nonce,uint256 deadline)"
     );
 
+    // ✅ MODIFIÉ : Ajout de bool isLimit dans le hash
     bytes32 private constant PLACE_ORDER_TYPEHASH = keccak256(
-        "PlaceOrder(address trader,uint32 assetId,bool isLong,uint8 leverage,int32 lotSize,uint48 targetPrice,uint48 stopLoss,uint48 takeProfit,uint256 nonce,uint256 deadline)"
+        "PlaceOrder(address trader,uint32 assetId,bool isLong,bool isLimit,uint8 leverage,int32 lotSize,uint48 targetPrice,uint48 stopLoss,uint48 takeProfit,uint256 nonce,uint256 deadline)"
     );
 
     bytes32 private constant CLOSE_MARKET_TYPEHASH = keccak256(
@@ -55,13 +59,12 @@ contract BrokexPaymaster is Pausable, Ownable {
         core = IBrokexCore(_core);
         CHAIN_ID = _chainId;
 
-        // Construction manuelle du Domain Separator pour garantir le ChainID
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256(bytes("BrokexPaymaster")),
                 keccak256(bytes("1")),
-                _chainId, // ✅ Force l'ID (ex: 688689)
+                _chainId,
                 address(this)
             )
         );
@@ -72,7 +75,7 @@ contract BrokexPaymaster is Pausable, Ownable {
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 
-    // ───────────── Internes / Helpers ─────────────
+    // ───────────── Internes ─────────────
 
     function _useNonce(address trader) internal returns (uint256 current) {
         current = nonces[trader];
@@ -87,14 +90,11 @@ contract BrokexPaymaster is Pausable, Ownable {
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
     }
 
-    // ✅ FONCTION VIEW DE DEBUG (Demandée)
-    // Permet de voir quelle adresse a signé ce hash
     function recoverSigner(bytes32 structHash, bytes calldata signature) external view returns (address) {
         bytes32 digest = _hashTypedDataV4(structHash);
         return ECDSA.recover(digest, signature);
     }
 
-    // Fonction interne de vérif
     function _verify(address trader, bytes32 structHash, bytes calldata signature) internal view {
         bytes32 digest = _hashTypedDataV4(structHash);
         address signer = ECDSA.recover(digest, signature);
@@ -103,7 +103,7 @@ contract BrokexPaymaster is Pausable, Ownable {
 
     // ───────────── EXÉCUTION (Relayed Functions) ─────────────
 
-    // 1. OPEN MARKET (Proof en argument, pas dans le hash)
+    // 1. OPEN MARKET
     function executeOpenMarket(
         address trader,
         uint32 assetId,
@@ -137,11 +137,12 @@ contract BrokexPaymaster is Pausable, Ownable {
         core.openMarketPositionFor(trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
-    // 2. PLACE ORDER
+    // 2. PLACE ORDER (LIMIT / STOP)
     function executePlaceOrder(
         address trader,
         uint32 assetId,
         bool isLong,
+        bool isLimit, // ✅ NOUVEAU PARAMÈTRE
         uint8 leverage,
         int32 lotSize,
         uint48 targetPrice,
@@ -153,11 +154,13 @@ contract BrokexPaymaster is Pausable, Ownable {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
 
+        // ✅ Mise à jour du Hash
         bytes32 structHash = keccak256(abi.encode(
             PLACE_ORDER_TYPEHASH,
             trader,
             assetId,
             isLong,
+            isLimit, // Inclus dans le hash
             leverage,
             lotSize,
             targetPrice,
@@ -169,10 +172,11 @@ contract BrokexPaymaster is Pausable, Ownable {
 
         _verify(trader, structHash, signature);
 
-        core.placeOrderFor(trader, assetId, isLong, leverage, lotSize, targetPrice, stopLoss, takeProfit);
+        // ✅ Appel mis à jour vers le Core
+        core.placeOrderFor(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
-    // 3. CLOSE MARKET (Proof en argument, pas dans le hash)
+    // 3. CLOSE MARKET
     function executeCloseMarket(
         address trader,
         uint256 tradeId,
