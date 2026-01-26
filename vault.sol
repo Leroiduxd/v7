@@ -2,12 +2,13 @@
 pragma solidity ^0.8.20;
 
 /*
-    BrokexVault V2.1 (Full Real Money LP Loop)
+    BrokexVault V4.3 (Provisioning / Escrow Model)
     
-    UPDATES:
-    - claimWithdraw NOW sends USDC directly to the user (no intermediate freeBalance step).
-    - Integrated IERC20 for real USDC deposits/withdrawals.
-    - rollEpoch fetches PnL from BrokexCore automatically.
+    UPDATES from V2.1:
+    - Removed 1% Trader Profit Fee.
+    - Added 'ownerFeeReserve' to sequester fees during the epoch.
+    - Added 'provisionCheckBps' (15%) taken on every LP win.
+    - Added Settlement logic in 'rollEpoch' to pay Owner max 20% of Net Realized PnL.
 */
 
 // ==========================================
@@ -36,11 +37,11 @@ contract BrokexVault {
     uint256 private constant USDC_TO_WAD = 1e12;
 
     // Fees (basis points)
-    uint256 public constant COMMISSION_OWNER_BPS = 3000; // 30%
+    uint256 public constant COMMISSION_OWNER_BPS = 3000; // 30% of opening fee
     uint256 public constant COMMISSION_BPS_DENOM = 10000;
 
-    uint256 public constant PROFIT_FEE_LP_BPS = 100; // 1% of trader profit
-    uint256 public constant PROFIT_FEE_DENOM = 10000;
+    // ✅ NEW: Target Performance Fee (20%) of Net Realized Profit
+    uint256 public constant TARGET_PERF_FEE_BPS = 2000; 
 
     // Dust threshold: 5 USD
     uint256 public constant DUST_CAPITAL6 = 5_000_000; 
@@ -49,9 +50,9 @@ contract BrokexVault {
     // Roles & Tokens
     // -----------------------------
     address public owner;
-    address public core;      
-    bool public coreSet;      
-    IERC20 public usdc;       
+    address public core;       
+    bool public coreSet;       
+    IERC20 public usdc;        
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
@@ -72,8 +73,13 @@ contract BrokexVault {
     // -----------------------------
     // LP capital accounting
     // -----------------------------
-    uint256 public lpFreeCapital;     
-    uint256 public lpLockedCapital;   
+    uint256 public lpFreeCapital;      
+    uint256 public lpLockedCapital;    
+
+    // ✅ NEW: Escrow & Provisioning State
+    int256 public currentEpochRealizedPnl; // Tracks Net PnL of LPs
+    uint256 public ownerFeeReserve;        // The Escrow Pot
+    uint256 public provisionCheckBps;      // Default 15% (1500)
 
     // -----------------------------
     // Trades
@@ -180,6 +186,10 @@ contract BrokexVault {
 
     event EpochRolled(uint256 indexed epochClosed, uint256 indexed epochOpened, uint256 priceWad, int256 equitySnapshot18, uint256 depositsAdded6, uint256 sharesMinted18);
     event DustSwept(uint256 capitalSwept6);
+    
+    // ✅ NEW EVENTS
+    event PerformanceFeePaid(uint256 indexed epoch, uint256 netProfit6, uint256 feeTaken6);
+    event ProvisionUpdated(uint256 newBps);
 
     // -----------------------------
     // Constructor & Settings
@@ -190,6 +200,7 @@ contract BrokexVault {
         currentEpoch = 0;
         epochStartTimestamp = block.timestamp;
         usdc = IERC20(_usdc);
+        provisionCheckBps = 1500; // ✅ Default 15% provisioning
     }
 
     function setOwner(address newOwner) external onlyOwner {
@@ -204,6 +215,13 @@ contract BrokexVault {
         core = _core;
         coreSet = true;
         emit CoreSet(_core);
+    }
+
+    // ✅ NEW: Allow owner to adjust provisioning (Max 20%)
+    function setProvisionCheck(uint256 _bps) external onlyOwner {
+        require(_bps <= 2000, "Max 20%");
+        provisionCheckBps = _bps;
+        emit ProvisionUpdated(_bps);
     }
 
     // -----------------------------
@@ -264,18 +282,24 @@ contract BrokexVault {
 
     function sweepDust() public {
         uint256 cap6 = _totalLpCapital6();
-        if (cap6 == 0) return;
-        if (cap6 >= DUST_CAPITAL6) return;
+        if (cap6 == 0 && ownerFeeReserve == 0) return;
+        
+        // If funds are extremely low, we assume protocol reset.
+        if (cap6 < DUST_CAPITAL6) {
+            uint256 totalSweep = cap6 + ownerFeeReserve;
+            
+            freeBalance[owner] += totalSweep;
+            lpFreeCapital = 0;
+            lpLockedCapital = 0;
+            ownerFeeReserve = 0;
+            totalShares = 0;
 
-        freeBalance[owner] += cap6;
-        lpFreeCapital = 0;
-        lpLockedCapital = 0;
-        totalShares = 0;
+            withdrawSharesUnfunded18 = 0;
+            minLpFreeReserve6 = 0;
+            currentEpochRealizedPnl = 0;
 
-        withdrawSharesUnfunded18 = 0;
-        minLpFreeReserve6 = 0;
-
-        emit DustSwept(cap6);
+            emit DustSwept(totalSweep);
+        }
     }
 
     // -----------------------------
@@ -333,25 +357,36 @@ contract BrokexVault {
         if (lpCut6 > 0) lpFreeCapital += lpCut6;
     }
 
+    // ✅ MODIFIED: Implements Provisioning & Removes 1% Trader Fee
     function _unlockAndSettle(address trader, uint256 marginLocked6, int256 pnl18) internal {
         require(lockedBalance[trader] >= marginLocked6, "locked < margin");
         lockedBalance[trader] -= marginLocked6;
 
         if (pnl18 >= 0) {
+            // Trader Wins -> LP Loses
             uint256 profit6 = _to6FromWad(uint256(pnl18));
             require(lpFreeCapital >= profit6, "lp insolvent (profit)");
 
-            uint256 fee6 = (profit6 * PROFIT_FEE_LP_BPS) / PROFIT_FEE_DENOM;
-            uint256 payoutProfit6 = profit6 - fee6;
-
-            freeBalance[trader] += (marginLocked6 + payoutProfit6);
-            lpFreeCapital -= payoutProfit6;
+            // Trader gets 100% of profit (No 1% fee anymore)
+            freeBalance[trader] += (marginLocked6 + profit6);
+            lpFreeCapital -= profit6;
         } else {
+            // Trader Loses -> LP Wins
             uint256 loss6 = _to6FromWad(uint256(-pnl18));
             if (loss6 > marginLocked6) loss6 = marginLocked6;
 
             freeBalance[trader] += (marginLocked6 - loss6);
-            lpFreeCapital += loss6;
+            
+            // ✅ PROVISIONING LOGIC (The Escrow)
+            // LP Net Profit here = loss6.
+            // We skim 'provisionCheckBps' (e.g. 15%) immediately.
+            uint256 provision6 = (loss6 * provisionCheckBps) / COMMISSION_BPS_DENOM;
+            uint256 lpShare6 = loss6 - provision6;
+
+            // Add provision to Escrow
+            ownerFeeReserve += provision6;
+            // Add remainder to LP Capital
+            lpFreeCapital += lpShare6;
         }
     }
 
@@ -406,6 +441,7 @@ contract BrokexVault {
         emit PositionCreated(tradeId, trader, margin6, commission6, lpLock6);
     }
 
+    // ✅ MODIFIED: Updates Realized PnL Tracker
     function closeTrade(uint256 tradeId, int256 pnl18) external onlyCore {
         Trade storage t = trades[tradeId];
         require(t.id != 0, "trade missing");
@@ -423,10 +459,16 @@ contract BrokexVault {
         _lpUnlock(t.lpLock);
         _unlockAndSettle(t.owner, t.margin, actualPnl18);
 
+        // Update realized PnL Tracker for LPs
+        // If trader wins (pnl > 0), LPs lose -> subtract actualPnl
+        // If trader loses (pnl < 0), LPs win -> subtract negative actualPnl (add positive)
+        currentEpochRealizedPnl -= actualPnl18;
+
         t.state = TradeState.Closed;
         emit TradeClosed(tradeId, pnl18, actualPnl18);
     }
 
+    // ✅ MODIFIED: Updates Realized PnL Tracker
     function liquidate(uint256 tradeId) external onlyCore {
         Trade storage t = trades[tradeId];
         require(t.id != 0, "trade missing");
@@ -434,6 +476,9 @@ contract BrokexVault {
 
         _lpUnlock(t.lpLock);
         _unlockAndSettle(t.owner, t.margin, -int256(_toWadFrom6(t.margin)));
+
+        // Liquidation = Trader loses 100% margin -> LP gains 100% margin
+        currentEpochRealizedPnl += int256(_toWadFrom6(t.margin));
 
         t.state = TradeState.Closed;
         emit TradeLiquidated(tradeId, t.margin);
@@ -533,11 +578,48 @@ contract BrokexVault {
 
         if (_totalLpCapital6() > 0 && _totalLpCapital6() < DUST_CAPITAL6) {
             sweepDust();
-            unrealizedPnlTraders18 = 0;
+            return;
         }
 
+        // ✅ NEW: SETTLE ESCROW / PERFORMANCE FEE
+        if (currentEpochRealizedPnl > 0) {
+            // Net Profit for Epoch!
+            uint256 netProfit6 = _to6FromWad(uint256(currentEpochRealizedPnl));
+            
+            // Calculate how much Owner is ACTUALLY entitled to (20% of Net)
+            uint256 entitledFee6 = (netProfit6 * TARGET_PERF_FEE_BPS) / COMMISSION_BPS_DENOM;
+
+            // Check Reserve
+            if (ownerFeeReserve >= entitledFee6) {
+                // OVER-PROVISIONED: We have enough in reserve.
+                // 1. Pay Owner
+                freeBalance[owner] += entitledFee6;
+                // 2. Refund excess to LPs (it was taken from them initially)
+                lpFreeCapital += (ownerFeeReserve - entitledFee6);
+                
+                emit PerformanceFeePaid(currentEpoch, netProfit6, entitledFee6);
+            } else {
+                // UNDER-PROVISIONED: We take what we have.
+                // 1. Owner gets entire reserve.
+                freeBalance[owner] += ownerFeeReserve;
+                // 2. LPs get nothing back, but nothing more is taken.
+                
+                emit PerformanceFeePaid(currentEpoch, netProfit6, ownerFeeReserve);
+            }
+        } else {
+            // Net Loss or Zero.
+            // Refund ENTIRE Reserve to LPs.
+            lpFreeCapital += ownerFeeReserve;
+        }
+
+        // Reset for next epoch
+        ownerFeeReserve = 0;
+        currentEpochRealizedPnl = 0;
+
+        // ✅ Standard Roll Logic continues (Equity Calc, etc.)
         uint256 e = currentEpoch;
         int256 lpEquity18 = int256(_toWadFrom6(lpFreeCapital + lpLockedCapital));
+        // Note: ownerFeeReserve is now empty, so full Equity belongs to LPs
         int256 equity18 = lpEquity18 - unrealizedPnlTraders18;
         uint256 priceWad;
 
