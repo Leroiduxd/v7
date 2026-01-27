@@ -32,6 +32,7 @@ interface IBrokexVault {
     function createPosition(uint256 tradeId, address trader, uint256 margin6, uint256 commission6, uint256 lpLock6) external;
     function closeTrade(uint256 tradeId, int256 pnl18) external;
     function liquidate(uint256 tradeId) external;
+    function addMarginToTrade(uint256 tradeId, uint256 amount6) external;
 }
 
 // ==========================================
@@ -946,5 +947,56 @@ contract BrokexCore {
             stopLosses[i] = t.stopLoss;
             takeProfits[i] = t.takeProfit;
         }
+    }
+
+    // ----------------------------------------------------------------
+    // 14. ADD MARGIN FUNCTIONS
+    // ----------------------------------------------------------------
+
+    /**
+     * @notice Ajoute de la marge à un trade existant (Trader direct)
+     * @param tradeId L'ID du trade
+     * @param amount6 Le montant à ajouter en USDC (6 décimales)
+     */
+    function addMargin(uint256 tradeId, uint64 amount6) external {
+        _addMargin(msg.sender, tradeId, amount6);
+    }
+
+    /**
+     * @notice Ajoute de la marge à un trade existant (Via Paymaster)
+     * @param trader L'adresse du trader concerné
+     * @param tradeId L'ID du trade
+     * @param amount6 Le montant à ajouter en USDC (6 décimales)
+     */
+    function addMarginFor(address trader, uint256 tradeId, uint64 amount6) external onlyPaymaster {
+        _addMargin(trader, tradeId, amount6);
+    }
+
+    /**
+     * @dev Logique interne pour l'ajout de marge
+     */
+    function _addMargin(address trader, uint256 tradeId, uint64 amount6) internal {
+        Trade storage t = trades[tradeId];
+        
+        // 1. Sécurité : Vérifier le propriétaire
+        if (t.trader != trader) revert NotYourTrade();
+        
+        // 2. Sécurité : Vérifier l'état (0=Pending, 1=Open uniquement)
+        if (t.state > 1) revert Closed();
+        
+        // 3. Mise à jour du Struct Trade
+        t.marginUsdc += amount6;
+
+        // 4. Mise à jour de l'Exposition (Impact Risque)
+        // Le trader ajoute du cash -> Il peut perdre plus -> Le protocole (LP) peut gagner plus.
+        // Donc on AUGMENTE la MaxLoss du côté du protocole.
+        // On ne change pas le MaxProfit (lpLockedCapital reste le même) ni les lots.
+        _updateExposureLimits(t.assetId, 0, uint64(amount6), t.isLong, true);
+
+        // 5. Appel au Vault pour sécuriser les fonds (Transfert Free -> Locked)
+        brokexVault.addMarginToTrade(tradeId, uint256(amount6));
+
+        // 6. Émission de l'Event (Code 6 = Add Margin)
+        emit TradeEvent(tradeId, 6);
     }
 }
