@@ -908,48 +908,41 @@ contract BrokexCore {
     }
 
     // ----------------------------------------------------------------
-    // 13. BATCH VIEW (Frontend Helper)
+    // 13. BATCH VIEW HELPERS (Optimized Polling)
     // ----------------------------------------------------------------
 
     /**
-     * @notice Récupère l'état (state) d'une plage d'IDs en un seul appel
-     * @param startId L'ID de début (ex: 150)
-     * @param endId L'ID de fin (ex: 200)
-     * @return states Un tableau d'états (0=Pending, 1=Open, 2=Closed, 3=Cancelled)
+     * @notice Récupère l'état d'une liste spécifique d'IDs
+     * @param tradeIds Tableau des IDs à vérifier (ex: [150, 155, 192])
+     * @return states Tableau des états correspondants (ex: [1, 1, 2])
      */
-    function getTradeStatesBatch(uint256 startId, uint256 endId) external view returns (uint8[] memory states) {
-        // Sécurité de base
-        if (startId > endId) return new uint8[](0);
-        
-        uint256 length = endId - startId + 1;
-        // On limite à 1000 pour éviter que le noeud RPC ne time-out
-        require(length <= 1000, "Range too big"); 
+    function getTradeStatesFromList(uint256[] calldata tradeIds) external view returns (uint8[] memory states) {
+        uint256 len = tradeIds.length;
+        // Limite de sécurité pour le RPC
+        if (len > 1000) revert("List too long");
 
-        states = new uint8[](length);
+        states = new uint8[](len);
         
-        for (uint256 i = 0; i < length; i++) {
-            // startId + i nous donne l'ID actuel (150, 151, 152...)
-            // On récupère juste le state (uint8) pour économiser la bande passante
-            states[i] = trades[startId + i].state;
+        for (uint256 i = 0; i < len; i++) {
+            states[i] = trades[tradeIds[i]].state;
         }
     }
 
     /**
-     * @notice Récupère les SL et TP pour une plage d'IDs
-     * @return stopLosses Liste des prix Stop Loss
-     * @return takeProfits Liste des prix Take Profit
+     * @notice Récupère les SL et TP pour une liste spécifique d'IDs
+     * @param tradeIds Tableau des IDs à vérifier (ex: [150, 155, 192])
+     * @return stopLosses Tableau des prix Stop Loss correspondants
+     * @return takeProfits Tableau des prix Take Profit correspondants
      */
-    function getTradeSLTPBatch(uint256 startId, uint256 endId) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
-        if (startId > endId) return (new uint48[](0), new uint48[](0));
-        
-        uint256 length = endId - startId + 1;
-        require(length <= 1000, "Range too big"); 
+    function getTradeSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
+        uint256 len = tradeIds.length;
+        if (len > 1000) revert("List too long");
 
-        stopLosses = new uint48[](length);
-        takeProfits = new uint48[](length);
+        stopLosses = new uint48[](len);
+        takeProfits = new uint48[](len);
         
-        for (uint256 i = 0; i < length; i++) {
-            Trade storage t = trades[startId + i];
+        for (uint256 i = 0; i < len; i++) {
+            Trade storage t = trades[tradeIds[i]];
             stopLosses[i] = t.stopLoss;
             takeProfits[i] = t.takeProfit;
         }
