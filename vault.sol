@@ -816,4 +816,38 @@ contract BrokexVault {
     function getLpTotalCapital18() external view returns (uint256 total18) {
         return _toWadFrom6(lpFreeCapital + lpLockedCapital);
     }
+
+    // -----------------------------
+    // ✅ ADD MARGIN (New Function)
+    // -----------------------------
+
+    /**
+     * @notice Ajoute de la marge à un trade existant depuis le freeBalance du trader
+     * @dev Appelé uniquement par le Core pour garantir la synchro
+     * @param tradeId L'ID du trade concerné
+     * @param amount6 Le montant à ajouter en USDC (6 décimales)
+     */
+    function addMarginToTrade(uint256 tradeId, uint256 amount6) external onlyCore {
+        require(amount6 > 0, "amount=0");
+        
+        Trade storage t = trades[tradeId];
+        
+        // Vérification du Owner (Sécurité interne)
+        // Note: Le Core fait déjà cette vérif, mais c'est bien de l'avoir ici aussi.
+        require(t.owner != address(0), "Trade not found");
+        
+        // Vérification de l'état (0=Pending, 1=Open)
+        // On interdit l'ajout sur un trade fermé (2) ou annulé (3)
+        require(t.state == TradeState.Pending || t.state == TradeState.Open, "Trade closed/cancelled");
+
+        // Vérification Solde Trader
+        require(freeBalance[t.owner] >= amount6, "Insufficient free balance");
+
+        // Exécution du transfert interne
+        freeBalance[t.owner] -= amount6;
+        lockedBalance[t.owner] += amount6;
+        
+        // Mise à jour de la marge stockée dans le struct Trade du Vault
+        t.margin += amount6;
+    }
 }
