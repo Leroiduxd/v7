@@ -9,16 +9,16 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 interface IBrokexCore {
     function openMarketPositionFor(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 stopLoss, uint48 takeProfit, bytes calldata oracleProof) external;
-    
-    // ✅ MODIFIÉ : Ajout de bool isLimit
     function placeOrderFor(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external;
-    
     function closePositionMarketFor(address trader, uint256 tradeId, bytes calldata oracleProof) external;
     function updateSLTPFor(address trader, uint256 tradeId, uint48 newSL, uint48 newTP) external;
     function cancelOrderFor(address trader, uint256 tradeId) external;
+    
+    // ✅ NOUVELLE FONCTION AJOUTÉE
+    function addMarginFor(address trader, uint256 tradeId, uint64 amount6) external;
 }
 
-/* ────────────────────────── Brokex Paymaster V3 ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V3.1 ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
@@ -35,7 +35,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         "OpenMarket(address trader,uint32 assetId,bool isLong,uint8 leverage,int32 lotSize,uint48 stopLoss,uint48 takeProfit,uint256 nonce,uint256 deadline)"
     );
 
-    // ✅ MODIFIÉ : Ajout de bool isLimit dans le hash
     bytes32 private constant PLACE_ORDER_TYPEHASH = keccak256(
         "PlaceOrder(address trader,uint32 assetId,bool isLong,bool isLimit,uint8 leverage,int32 lotSize,uint48 targetPrice,uint48 stopLoss,uint48 takeProfit,uint256 nonce,uint256 deadline)"
     );
@@ -50,6 +49,11 @@ contract BrokexPaymaster is Pausable, Ownable {
 
     bytes32 private constant CANCEL_ORDER_TYPEHASH = keccak256(
         "CancelOrder(address trader,uint256 tradeId,uint256 nonce,uint256 deadline)"
+    );
+
+    // ✅ NOUVEAU TYPEHASH POUR ADD MARGIN
+    bytes32 private constant ADD_MARGIN_TYPEHASH = keccak256(
+        "AddMargin(address trader,uint256 tradeId,uint64 amount6,uint256 nonce,uint256 deadline)"
     );
 
     // ───────────── Constructor ─────────────
@@ -88,11 +92,6 @@ contract BrokexPaymaster is Pausable, Ownable {
 
     function _hashTypedDataV4(bytes32 structHash) internal view returns (bytes32) {
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-    }
-
-    function recoverSigner(bytes32 structHash, bytes calldata signature) external view returns (address) {
-        bytes32 digest = _hashTypedDataV4(structHash);
-        return ECDSA.recover(digest, signature);
     }
 
     function _verify(address trader, bytes32 structHash, bytes calldata signature) internal view {
@@ -142,7 +141,7 @@ contract BrokexPaymaster is Pausable, Ownable {
         address trader,
         uint32 assetId,
         bool isLong,
-        bool isLimit, // ✅ NOUVEAU PARAMÈTRE
+        bool isLimit,
         uint8 leverage,
         int32 lotSize,
         uint48 targetPrice,
@@ -154,13 +153,12 @@ contract BrokexPaymaster is Pausable, Ownable {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
 
-        // ✅ Mise à jour du Hash
         bytes32 structHash = keccak256(abi.encode(
             PLACE_ORDER_TYPEHASH,
             trader,
             assetId,
             isLong,
-            isLimit, // Inclus dans le hash
+            isLimit,
             leverage,
             lotSize,
             targetPrice,
@@ -172,7 +170,6 @@ contract BrokexPaymaster is Pausable, Ownable {
 
         _verify(trader, structHash, signature);
 
-        // ✅ Appel mis à jour vers le Core
         core.placeOrderFor(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
@@ -248,5 +245,30 @@ contract BrokexPaymaster is Pausable, Ownable {
         _verify(trader, structHash, signature);
 
         core.cancelOrderFor(trader, tradeId);
+    }
+
+    // 6. ✅ ADD MARGIN (NEW)
+    function executeAddMargin(
+        address trader,
+        uint256 tradeId,
+        uint64 amount6,
+        uint256 deadline,
+        bytes calldata signature
+    ) external whenNotPaused {
+        _checkDeadline(deadline);
+        uint256 nonce = _useNonce(trader);
+
+        bytes32 structHash = keccak256(abi.encode(
+            ADD_MARGIN_TYPEHASH,
+            trader,
+            tradeId,
+            amount6,
+            nonce,
+            deadline
+        ));
+
+        _verify(trader, structHash, signature);
+
+        core.addMarginFor(trader, tradeId, amount6);
     }
 }
