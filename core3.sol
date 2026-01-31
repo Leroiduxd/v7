@@ -888,7 +888,7 @@ contract BrokexCore {
    
 
     /**
-     * @dev Logique interne pour l'ajout de marge
+     * @dev Ajoute de la marge. Met à jour l'exposition UNIQUEMENT si le trade est déjà ouvert.
      */
     function addMargin(address trader, uint256 tradeId, uint64 amount6) external onlyPaymaster {
         Trade storage t = trades[tradeId];
@@ -897,21 +897,27 @@ contract BrokexCore {
         if (t.trader != trader) revert NotYourTrade();
         
         // 2. Sécurité : Vérifier l'état (0=Pending, 1=Open uniquement)
+        // On refuse l'ajout sur un trade fermé (2) ou annulé (3)
         if (t.state > 1) revert Closed();
         
-        // 3. Mise à jour du Struct Trade
+        // 3. Mise à jour du Struct Trade (Toujours faire ça)
+        // On augmente la marge stockée dans le trade, qu'il soit Pending ou Open.
         t.marginUsdc += amount6;
 
-        // 4. Mise à jour de l'Exposition (Impact Risque)
-        // Le trader ajoute du cash -> Il peut perdre plus -> Le protocole (LP) peut gagner plus.
-        // Donc on AUGMENTE la MaxLoss du côté du protocole.
-        // On ne change pas le MaxProfit (lpLockedCapital reste le même) ni les lots.
-        _updateExposureLimits(t.assetId, 0, uint64(amount6), t.isLong, true);
+        // 4. Mise à jour de l'Exposition (CORRECTIF BUG)
+        // On ne touche aux variables globales d'exposition que si le trade est ACTIF (Open).
+        // Si c'est un ordre (Pending), l'exposition sera calculée au moment de l'exécution (executeOrder).
+        if (t.state == 1) {
+            // Le trader ajoute du cash sur une position ouverte -> Il peut perdre plus.
+            // On augmente la MaxLoss du côté du protocole (Exposure).
+            _updateExposureLimits(t.assetId, 0, uint64(amount6), t.isLong, true);
+        }
 
         // 5. Appel au Vault pour sécuriser les fonds (Transfert Free -> Locked)
+        // Cela doit se faire dans les deux cas (Pending ou Open) pour bloquer l'argent.
         brokexVault.addMarginToTrade(tradeId, uint256(amount6));
 
-        // 6. Émission de l'Event (Code 6 = Add Margin)
+        // 6. Émission de l'Event
         emit TradeEvent(tradeId, 6);
     }
 }
