@@ -630,8 +630,11 @@ contract BrokexCore {
         emit TradeEvent(tradeId, 1);
     }
 
-    function closePositionMarket(uint256 tradeId, bytes calldata oracleProof) external onlyPaymaster {
+    function closePositionMarket(address trader, uint256 tradeId, bytes calldata oracleProof) external onlyPaymaster {
         Trade storage t = trades[tradeId];
+        // Sécurité : Seul le propriétaire peut fermer manuellement
+        if (t.trader != trader) revert NotYourTrade();
+
         if (t.state != 1) revert NotOpen();
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
         _finalizeClose(t, price1e6, tradeId);
@@ -669,8 +672,11 @@ contract BrokexCore {
         _finalizeClose(t, price1e6, tradeId);
     }
 
-    function updateSLTP(uint256 tradeId, uint48 newSL, uint48 newTP) external onlyPaymaster {
+    function updateSLTP(address trader, uint256 tradeId, uint48 newSL, uint48 newTP) external onlyPaymaster {
         Trade storage t = trades[tradeId];
+        // Sécurité : Seul le propriétaire peut modifier
+        if (t.trader != trader) revert NotYourTrade();
+        
         if (t.state > 1) revert Closed();
         (bool ok, string memory reason) = validateStops(uint256(t.openPrice), t.isLong, newSL, newTP);
         if (!ok) revert(reason);
@@ -678,8 +684,11 @@ contract BrokexCore {
         emit TradeEvent(tradeId, 5);
     }
 
-    function cancelOrder(uint256 tradeId) external onlyPaymaster {
+    function cancelOrder(address trader, uint256 tradeId) external onlyPaymaster {
         Trade storage t = trades[tradeId];
+        // Sécurité : Seul le propriétaire peut annuler
+        if (t.trader != trader) revert NotYourTrade();
+
         if (t.state != 0) revert NotPending();
         t.state = 3;
         brokexVault.cancelOrder(tradeId);
