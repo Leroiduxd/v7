@@ -75,6 +75,7 @@ contract BrokexCore {
     error LongSlTooHigh();
     error ShortTpTooHigh();
     error ShortSlTooLow();
+    error PnlUnderCap();
 
     // ----------------------------------------------------------------
     // CONSTANTES & STATE
@@ -840,47 +841,7 @@ contract BrokexCore {
         );
     }
 
-    // ----------------------------------------------------------------
-    // 13. BATCH VIEW HELPERS (Optimized Polling)
-    // ----------------------------------------------------------------
-
-    /**
-     * @notice Récupère l'état d'une liste spécifique d'IDs
-     * @param tradeIds Tableau des IDs à vérifier (ex: [150, 155, 192])
-     * @return states Tableau des états correspondants (ex: [1, 1, 2])
-     */
-    function getTradeStatesFromList(uint256[] calldata tradeIds) external view returns (uint8[] memory states) {
-        uint256 len = tradeIds.length;
-        // Limite de sécurité pour le RPC
-        if (len > 1000) revert("List too long");
-
-        states = new uint8[](len);
-        
-        for (uint256 i = 0; i < len; i++) {
-            states[i] = trades[tradeIds[i]].state;
-        }
-    }
-
-    /**
-     * @notice Récupère les SL et TP pour une liste spécifique d'IDs
-     * @param tradeIds Tableau des IDs à vérifier (ex: [150, 155, 192])
-     * @return stopLosses Tableau des prix Stop Loss correspondants
-     * @return takeProfits Tableau des prix Take Profit correspondants
-     */
-    function getTradeSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
-        uint256 len = tradeIds.length;
-        if (len > 1000) revert("List too long");
-
-        stopLosses = new uint48[](len);
-        takeProfits = new uint48[](len);
-        
-        for (uint256 i = 0; i < len; i++) {
-            Trade storage t = trades[tradeIds[i]];
-            stopLosses[i] = t.stopLoss;
-            takeProfits[i] = t.takeProfit;
-        }
-    }
-
+   
     // ----------------------------------------------------------------
     // 14. ADD MARGIN FUNCTIONS
     // ----------------------------------------------------------------
@@ -919,5 +880,40 @@ contract BrokexCore {
 
         // 6. Émission de l'Event
         emit TradeEvent(tradeId, 6);
+    }
+
+    /**
+     * @notice Liquide positivement un trade qui a dépassé son gain maximal (LP Locked Capital).
+     * @dev Permet de fermer une position dont le PnL Net > Capacité de paiement du Vault.
+     * @param tradeId L'identifiant du trade.
+     * @param oracleProof La preuve cryptographique du prix actuel (Supra).
+     */
+    function liquidateProfit(uint256 tradeId, bytes calldata oracleProof) external {
+        Trade storage t = trades[tradeId];
+
+        // 1. Vérifier que le trade est bien ouvert
+        if (t.state != 1) revert NotOpen();
+
+        // 2. Obtenir le prix actuel certifié
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+
+        // 3. Calculer le PnL Net Réel (18 décimales)
+        // Cette fonction interne prend déjà en compte : Spread de fermeture, Funding, Weekend Fees.
+        int256 netPnl = _calculateNetPnl(t, price1e6, tradeId);
+
+        // 4. Condition de Liquidation Positive
+        // Le trader ne peut pas gagner plus que ce qui est bloqué pour lui (lpLockedCapital).
+        // lpLockedCapital est en 6 décimales (USDC), on convertit en 18 pour comparer au PnL.
+        uint256 maxPayout18 = uint256(t.lpLockedCapital) * 1e12;
+
+        // Si le PnL est négatif ou s'il est encore sous la limite, on annule.
+        if (netPnl <= 0 || uint256(netPnl) <= maxPayout18) {
+            // Tu peux définir cette erreur en haut du contrat: error PnlUnderCap();
+            revert("PnlUnderCap"); 
+        }
+
+        // 5. Exécution de la fermeture
+        // Cela va créditer le trader, libérer le LP, update l'exposition et mettre l'état à Closed (2).
+        _finalizeClose(t, price1e6, tradeId);
     }
 }
