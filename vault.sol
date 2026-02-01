@@ -562,68 +562,70 @@ contract BrokexVault {
     bool public firstRollDone;
 
     function rollEpoch() external {
-        if (!firstRollDone) {
+        // 1. Sécurité : Le tout premier lancement (passage de 0 à 1) doit être fait par l'owner.
+        if (currentEpoch == 0) {
             require(msg.sender == owner, "First roll: owner only");
         }
-        require(block.timestamp >= epochStartTimestamp + EPOCH_DURATION, "epoch not ended");
 
-        require(core != address(0), "Core not set");
-        (int256 pnlCore, uint64 tsCore) = IBrokexCore(core).getLastFinishedPnlRun();
-        
-        // Safety checks for PnL freshness
-        require(block.timestamp >= tsCore, "PnL in future?");
-        require(block.timestamp - tsCore <= 120, "PnL stale (>2min)");
-        
-        int256 unrealizedPnlTraders18 = pnlCore;
+        // 2. Condition Temporelle : On ne vérifie la durée QUE si on n'est pas au démarrage (Epoch > 0).
+        // Cela permet de lancer l'Epoch 1 immédiatement après le déploiement sans attendre 24h.
+        if (currentEpoch > 0) {
+            require(block.timestamp >= epochStartTimestamp + EPOCH_DURATION, "epoch not ended");
+        }
+
+        int256 unrealizedPnlTraders18 = 0;
+
+        // 3. PnL Non Réalisé : On n'appelle le Core QUE si on n'est pas au démarrage.
+        // À l'Epoch 0, il n'y a pas de trades ouverts, donc le PnL est forcé à 0.
+        // Cela évite de devoir faire tourner un script de PnL à vide avant de lancer le protocole.
+        if (currentEpoch > 0) {
+            require(core != address(0), "Core not set");
+            (int256 pnlCore, uint64 tsCore) = IBrokexCore(core).getLastFinishedPnlRun();
+            
+            // Sécurités de timestamp PnL classiques
+            require(block.timestamp >= tsCore, "PnL in future?");
+            require(block.timestamp - tsCore <= 120, "PnL stale (>2min)");
+            
+            unrealizedPnlTraders18 = pnlCore;
+        }
+
+        // --- À PARTIR D'ICI, LE RESTE DE LA LOGIQUE EST IDENTIQUE ---
 
         if (_totalLpCapital6() > 0 && _totalLpCapital6() < DUST_CAPITAL6) {
             sweepDust();
             return;
         }
 
-        // ✅ NEW: SETTLE ESCROW / PERFORMANCE FEE
+        // Settlement des Frais de Performance (Escrow)
         if (currentEpochRealizedPnl > 0) {
-            // Net Profit for Epoch!
             uint256 netProfit6 = _to6FromWad(uint256(currentEpochRealizedPnl));
-            
-            // Calculate how much Owner is ACTUALLY entitled to (20% of Net)
             uint256 entitledFee6 = (netProfit6 * TARGET_PERF_FEE_BPS) / COMMISSION_BPS_DENOM;
 
-            // Check Reserve
             if (ownerFeeReserve >= entitledFee6) {
-                // OVER-PROVISIONED: We have enough in reserve.
-                // 1. Pay Owner
                 freeBalance[owner] += entitledFee6;
-                // 2. Refund excess to LPs (it was taken from them initially)
                 lpFreeCapital += (ownerFeeReserve - entitledFee6);
-                
                 emit PerformanceFeePaid(currentEpoch, netProfit6, entitledFee6);
             } else {
-                // UNDER-PROVISIONED: We take what we have.
-                // 1. Owner gets entire reserve.
                 freeBalance[owner] += ownerFeeReserve;
-                // 2. LPs get nothing back, but nothing more is taken.
-                
                 emit PerformanceFeePaid(currentEpoch, netProfit6, ownerFeeReserve);
             }
         } else {
-            // Net Loss or Zero.
-            // Refund ENTIRE Reserve to LPs.
             lpFreeCapital += ownerFeeReserve;
         }
 
-        // Reset for next epoch
+        // Reset pour la prochaine époque
         ownerFeeReserve = 0;
         currentEpochRealizedPnl = 0;
 
-        // ✅ Standard Roll Logic continues (Equity Calc, etc.)
+        // Calcul de l'Equity et du Prix
         uint256 e = currentEpoch;
         int256 lpEquity18 = int256(_toWadFrom6(lpFreeCapital + lpLockedCapital));
-        // Note: ownerFeeReserve is now empty, so full Equity belongs to LPs
         int256 equity18 = lpEquity18 - unrealizedPnlTraders18;
         uint256 priceWad;
 
         if (totalShares == 0) {
+            // Au premier lancement, comme unrealizedPnlTraders18 est forcé à 0 plus haut,
+            // et totalShares est 0, le prix sera fixé à 1.0 (WAD).
             require(unrealizedPnlTraders18 == 0, "unrealizedPnL must be 0 when totalShares=0");
             priceWad = WAD;
             require(equity18 >= 0, "equity<0");
@@ -636,6 +638,7 @@ contract BrokexVault {
         lpTokenPrice[e] = priceWad;
         epochEquitySnapshot18[e] = equity18;
 
+        // Traitement des Dépôts (Minting des Shares)
         uint256 deposits6 = totalPendingDeposits[e];
         uint256 sharesMinted18 = 0;
         if (deposits6 > 0) {
@@ -645,6 +648,7 @@ contract BrokexVault {
             lpFreeCapital += deposits6;
         }
 
+        // Traitement des Retraits (Réservation du Capital)
         uint256 unpaidMinusPaid18 = 0;
         if (totalWithdrawSharesOutstanding18 > totalPaidSharesPendingAlloc18) {
             unpaidMinusPaid18 = totalWithdrawSharesOutstanding18 - totalPaidSharesPendingAlloc18;
@@ -681,9 +685,13 @@ contract BrokexVault {
         if (withdrawSharesUnfunded18 == 0) minLpFreeReserve6 = 0;
         else minLpFreeReserve6 = _to6FromWad(_mulDiv(withdrawSharesUnfunded18, priceWad, WAD));
 
+        // Passage à l'époque suivante
         currentEpoch = e + 1;
         epochStartTimestamp = block.timestamp;
-        if (!firstRollDone) firstRollDone = true;
+        
+        // On marque que le premier roll est fait (utile pour la logique owner only du début)
+        if (!firstRollDone) firstRollDone = true; 
+        
         emit EpochRolled(e, currentEpoch, priceWad, equity18, deposits6, sharesMinted18);
     }
 
