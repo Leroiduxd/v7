@@ -5,20 +5,41 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-/* ────────────────────────── Interface vers BrokexCore ────────────────────────── */
+/* ────────────────────────── Interface Synchronisée + Lecture Data ────────────────────────── */
 
 interface IBrokexCore {
-    function openMarketPositionFor(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 stopLoss, uint48 takeProfit, bytes calldata oracleProof) external;
-    function placeOrderFor(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external;
-    function closePositionMarketFor(address trader, uint256 tradeId, bytes calldata oracleProof) external;
-    function updateSLTPFor(address trader, uint256 tradeId, uint48 newSL, uint48 newTP) external;
-    function cancelOrderFor(address trader, uint256 tradeId) external;
-    
-    // ✅ NOUVELLE FONCTION AJOUTÉE
-    function addMarginFor(address trader, uint256 tradeId, uint64 amount6) external;
+    // Structure nécessaire pour lire les infos des trades depuis le Core
+    struct Trade {
+        address trader;
+        uint32 assetId;
+        bool isLong;
+        bool isLimit;
+        uint8 leverage;
+        uint48 openPrice;      
+        uint8 state; 
+        uint32 openTimestamp;
+        uint128 fundingIndex;
+        uint48 closePrice;     
+        int32 lotSize;
+        uint48 stopLoss;
+        uint48 takeProfit;
+        uint64 lpLockedCapital;
+        uint64 marginUsdc;
+    }
+
+    // Getter automatique du mapping trades dans le Core
+    function trades(uint256 tradeId) external view returns (Trade memory);
+
+    // --- Fonctions d'écriture ---
+    function openMarketPosition(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 stopLoss, uint48 takeProfit, bytes calldata oracleProof) external;
+    function placeOrder(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external;
+    function closePositionMarket(address trader, uint256 tradeId, bytes calldata oracleProof) external;
+    function updateSLTP(address trader, uint256 tradeId, uint48 newSL, uint48 newTP) external;
+    function cancelOrder(address trader, uint256 tradeId) external;
+    function addMargin(address trader, uint256 tradeId, uint64 amount6) external;
 }
 
-/* ────────────────────────── Brokex Paymaster V3.1 ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V4.3 (Relay + Lens) ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
@@ -51,7 +72,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         "CancelOrder(address trader,uint256 tradeId,uint256 nonce,uint256 deadline)"
     );
 
-    // ✅ NOUVEAU TYPEHASH POUR ADD MARGIN
     bytes32 private constant ADD_MARGIN_TYPEHASH = keccak256(
         "AddMargin(address trader,uint256 tradeId,uint64 amount6,uint256 nonce,uint256 deadline)"
     );
@@ -74,12 +94,8 @@ contract BrokexPaymaster is Pausable, Ownable {
         );
     }
 
-    // ───────────── Admin ─────────────
-
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
-
-    // ───────────── Internes ─────────────
 
     function _useNonce(address trader) internal returns (uint256 current) {
         current = nonces[trader];
@@ -90,19 +106,16 @@ contract BrokexPaymaster is Pausable, Ownable {
         require(block.timestamp <= deadline, "DEADLINE_EXPIRED");
     }
 
-    function _hashTypedDataV4(bytes32 structHash) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-    }
-
     function _verify(address trader, bytes32 structHash, bytes calldata signature) internal view {
-        bytes32 digest = _hashTypedDataV4(structHash);
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         address signer = ECDSA.recover(digest, signature);
         require(signer == trader, "INVALID_SIGNATURE");
     }
 
-    // ───────────── EXÉCUTION (Relayed Functions) ─────────────
+    // =========================================================================
+    //                                1. OPEN MARKET
+    // =========================================================================
 
-    // 1. OPEN MARKET
     function executeOpenMarket(
         address trader,
         uint32 assetId,
@@ -117,26 +130,27 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-
-        bytes32 structHash = keccak256(abi.encode(
-            OPEN_MARKET_TYPEHASH,
-            trader,
-            assetId,
-            isLong,
-            leverage,
-            lotSize,
-            stopLoss,
-            takeProfit,
-            nonce,
-            deadline
-        ));
-
+        bytes32 structHash = keccak256(abi.encode(OPEN_MARKET_TYPEHASH, trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, nonce, deadline));
         _verify(trader, structHash, signature);
-
-        core.openMarketPositionFor(trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
+        core.openMarketPosition(trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
-    // 2. PLACE ORDER (LIMIT / STOP)
+    function openMarketPosition(
+        uint32 assetId,
+        bool isLong,
+        uint8 leverage,
+        int32 lotSize,
+        uint48 stopLoss,
+        uint48 takeProfit,
+        bytes calldata oracleProof
+    ) external whenNotPaused {
+        core.openMarketPosition(msg.sender, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
+    }
+
+    // =========================================================================
+    //                                2. PLACE ORDER
+    // =========================================================================
+
     function executePlaceOrder(
         address trader,
         uint32 assetId,
@@ -152,28 +166,28 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-
-        bytes32 structHash = keccak256(abi.encode(
-            PLACE_ORDER_TYPEHASH,
-            trader,
-            assetId,
-            isLong,
-            isLimit,
-            leverage,
-            lotSize,
-            targetPrice,
-            stopLoss,
-            takeProfit,
-            nonce,
-            deadline
-        ));
-
+        bytes32 structHash = keccak256(abi.encode(PLACE_ORDER_TYPEHASH, trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit, nonce, deadline));
         _verify(trader, structHash, signature);
-
-        core.placeOrderFor(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
+        core.placeOrder(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
-    // 3. CLOSE MARKET
+    function placeOrder(
+        uint32 assetId,
+        bool isLong,
+        bool isLimit,
+        uint8 leverage,
+        int32 lotSize,
+        uint48 targetPrice,
+        uint48 stopLoss,
+        uint48 takeProfit
+    ) external whenNotPaused {
+        core.placeOrder(msg.sender, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
+    }
+
+    // =========================================================================
+    //                                3. CLOSE MARKET
+    // =========================================================================
+
     function executeCloseMarket(
         address trader,
         uint256 tradeId,
@@ -183,21 +197,19 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-
-        bytes32 structHash = keccak256(abi.encode(
-            CLOSE_MARKET_TYPEHASH,
-            trader,
-            tradeId,
-            nonce,
-            deadline
-        ));
-
+        bytes32 structHash = keccak256(abi.encode(CLOSE_MARKET_TYPEHASH, trader, tradeId, nonce, deadline));
         _verify(trader, structHash, signature);
-
-        core.closePositionMarketFor(trader, tradeId, oracleProof);
+        core.closePositionMarket(trader, tradeId, oracleProof);
     }
 
-    // 4. UPDATE SL/TP
+    function closePositionMarket(uint256 tradeId, bytes calldata oracleProof) external whenNotPaused {
+        core.closePositionMarket(msg.sender, tradeId, oracleProof);
+    }
+
+    // =========================================================================
+    //                                4. UPDATE SL/TP
+    // =========================================================================
+
     function executeUpdateSLTP(
         address trader,
         uint256 tradeId,
@@ -208,23 +220,19 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-
-        bytes32 structHash = keccak256(abi.encode(
-            UPDATE_SLTP_TYPEHASH,
-            trader,
-            tradeId,
-            newSL,
-            newTP,
-            nonce,
-            deadline
-        ));
-
+        bytes32 structHash = keccak256(abi.encode(UPDATE_SLTP_TYPEHASH, trader, tradeId, newSL, newTP, nonce, deadline));
         _verify(trader, structHash, signature);
-
-        core.updateSLTPFor(trader, tradeId, newSL, newTP);
+        core.updateSLTP(trader, tradeId, newSL, newTP);
     }
 
-    // 5. CANCEL ORDER
+    function updateSLTP(uint256 tradeId, uint48 newSL, uint48 newTP) external whenNotPaused {
+        core.updateSLTP(msg.sender, tradeId, newSL, newTP);
+    }
+
+    // =========================================================================
+    //                                5. CANCEL ORDER
+    // =========================================================================
+
     function executeCancelOrder(
         address trader,
         uint256 tradeId,
@@ -233,21 +241,19 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-
-        bytes32 structHash = keccak256(abi.encode(
-            CANCEL_ORDER_TYPEHASH,
-            trader,
-            tradeId,
-            nonce,
-            deadline
-        ));
-
+        bytes32 structHash = keccak256(abi.encode(CANCEL_ORDER_TYPEHASH, trader, tradeId, nonce, deadline));
         _verify(trader, structHash, signature);
-
-        core.cancelOrderFor(trader, tradeId);
+        core.cancelOrder(trader, tradeId);
     }
 
-    // 6. ✅ ADD MARGIN (NEW)
+    function cancelOrder(uint256 tradeId) external whenNotPaused {
+        core.cancelOrder(msg.sender, tradeId);
+    }
+
+    // =========================================================================
+    //                                6. ADD MARGIN
+    // =========================================================================
+
     function executeAddMargin(
         address trader,
         uint256 tradeId,
@@ -257,18 +263,44 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-
-        bytes32 structHash = keccak256(abi.encode(
-            ADD_MARGIN_TYPEHASH,
-            trader,
-            tradeId,
-            amount6,
-            nonce,
-            deadline
-        ));
-
+        bytes32 structHash = keccak256(abi.encode(ADD_MARGIN_TYPEHASH, trader, tradeId, amount6, nonce, deadline));
         _verify(trader, structHash, signature);
+        core.addMargin(trader, tradeId, amount6);
+    }
 
-        core.addMarginFor(trader, tradeId, amount6);
+    function addMargin(uint256 tradeId, uint64 amount6) external whenNotPaused {
+        core.addMargin(msg.sender, tradeId, amount6);
+    }
+
+    // =========================================================================
+    //                                7. BATCH VIEW HELPERS
+    // =========================================================================
+    // Ces fonctions appellent le Core pour lire les données sans stocker de logique ici.
+
+    function getTradeStatesFromList(uint256[] calldata tradeIds) external view returns (uint8[] memory states) {
+        uint256 len = tradeIds.length;
+        if (len > 1000) revert("List too long");
+
+        states = new uint8[](len);
+        for (uint256 i = 0; i < len; i++) {
+            // Lecture externe vers le Core
+            IBrokexCore.Trade memory t = core.trades(tradeIds[i]);
+            states[i] = t.state;
+        }
+    }
+
+    function getTradeSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
+        uint256 len = tradeIds.length;
+        if (len > 1000) revert("List too long");
+
+        stopLosses = new uint48[](len);
+        takeProfits = new uint48[](len);
+        
+        for (uint256 i = 0; i < len; i++) {
+            // Lecture externe vers le Core
+            IBrokexCore.Trade memory t = core.trades(tradeIds[i]);
+            stopLosses[i] = t.stopLoss;
+            takeProfits[i] = t.takeProfit;
+        }
     }
 }
