@@ -297,42 +297,41 @@ contract BrokexPaymaster is Pausable, Ownable {
         core.addMargin(msg.sender, tradeId, amount6);
     }
 
-    // =========================================================================
-    //                                7. VIEW & PAGINATION
-    // =========================================================================
-
     /**
-     * @notice Récupère les trades d'un utilisateur avec pagination.
-     * @dev Lit la liste des IDs stockée dans le Paymaster, puis fetch les détails dans le Core.
+     * @notice Récupère uniquement la liste des IDs de trades (Pagination légère)
      * @param trader L'adresse du trader
-     * @param cursor L'index de départ dans la liste (ex: 0 pour le début)
-     * @param size Le nombre de trades voulus
-     * @return _trades La liste des structs Trade complets
-     * @return total Le nombre total de trades de l'utilisateur
+     * @param cursor L'index de départ (ex: 90 pour commencer au 90ème trade)
+     * @param size Le nombre d'IDs voulus (ex: 10)
+     * @return ids La liste des IDs (ex: [101, 102, 103...])
+     * @return total Le nombre total de trades de l'utilisateur (ex: 105)
      */
     function getTradesPagination(address trader, uint256 cursor, uint256 size) 
         external 
         view 
-        returns (IBrokexCore.Trade[] memory _trades, uint256 total) 
+        returns (uint256[] memory ids, uint256 total) 
     {
-        uint256[] memory ids = traderTradeIds[trader];
-        total = ids.length;
+        // 1. On récupère la liste complète stockée dans le Paymaster
+        uint256[] memory allIds = traderTradeIds[trader];
+        total = allIds.length;
 
+        // 2. Si on demande une page qui n'existe pas, on renvoie vide
         if (cursor >= total) {
-            return (new IBrokexCore.Trade[](0), total);
+            return (new uint256[](0), total);
         }
 
+        // 3. Calcul de la taille réelle du tableau à renvoyer
+        // Si on demande 10 mais qu'il n'en reste que 3, on renvoie 3.
         uint256 realSize = (cursor + size > total) ? (total - cursor) : size;
-        _trades = new IBrokexCore.Trade[](realSize);
+        
+        // 4. Initialisation du tableau de résultats
+        ids = new uint256[](realSize);
 
+        // 5. Remplissage (Copie simple des IDs)
         for (uint256 i = 0; i < realSize; i++) {
-            // 1. Récupère l'ID depuis la liste locale du Paymaster
-            uint256 tradeId = ids[cursor + i];
-            // 2. Va chercher les données lourdes dans le Core
-            _trades[i] = core.trades(tradeId);
+            ids[i] = allIds[cursor + i];
         }
         
-        return (_trades, total);
+        return (ids, total);
     }
 
     // Helper pour récupérer juste les états (utile pour le frontend qui veut refresh vite)
