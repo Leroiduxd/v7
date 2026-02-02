@@ -15,17 +15,20 @@ interface IBrokexCore {
         bool isLong;
         bool isLimit;
         uint8 leverage;
-        uint48 openPrice;      
+        uint48 openPrice;       
         uint8 state; 
         uint32 openTimestamp;
         uint128 fundingIndex;
-        uint48 closePrice;     
+        uint48 closePrice;      
         int32 lotSize;
         uint48 stopLoss;
         uint48 takeProfit;
         uint64 lpLockedCapital;
         uint64 marginUsdc;
     }
+
+    // ✅ CRUCIAL : Permet au Paymaster de savoir quel sera le prochain ID
+    function nextTradeID() external view returns (uint256);
 
     // Getter automatique du mapping trades dans le Core
     function trades(uint256 tradeId) external view returns (Trade memory);
@@ -39,7 +42,7 @@ interface IBrokexCore {
     function addMargin(address trader, uint256 tradeId, uint64 amount6) external;
 }
 
-/* ────────────────────────── Brokex Paymaster V4.3 (Relay + Lens) ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V4.4 (Relay + List Manager) ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
@@ -49,6 +52,9 @@ contract BrokexPaymaster is Pausable, Ownable {
     bytes32 public immutable DOMAIN_SEPARATOR; 
     
     mapping(address => uint256) public nonces;
+
+    // ✅ NOUVEAU : Liste des IDs de trades par trader (Géré ici pour alléger le Core)
+    mapping(address => uint256[]) public traderTradeIds;
 
     // ───────────── TypeHashes ─────────────
 
@@ -132,6 +138,12 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint256 nonce = _useNonce(trader);
         bytes32 structHash = keccak256(abi.encode(OPEN_MARKET_TYPEHASH, trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, nonce, deadline));
         _verify(trader, structHash, signature);
+
+        // ✅ SYNC : On lit le compteur actuel du Core. 
+        // Comme le Core fait "++nextTradeID", le prochain sera (actuel + 1).
+        uint256 predictedId = core.nextTradeID() + 1;
+        traderTradeIds[trader].push(predictedId);
+
         core.openMarketPosition(trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
@@ -144,6 +156,10 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint48 takeProfit,
         bytes calldata oracleProof
     ) external whenNotPaused {
+        // ✅ SYNC : Même logique pour l'appel direct
+        uint256 predictedId = core.nextTradeID() + 1;
+        traderTradeIds[msg.sender].push(predictedId);
+
         core.openMarketPosition(msg.sender, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
@@ -168,6 +184,11 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint256 nonce = _useNonce(trader);
         bytes32 structHash = keccak256(abi.encode(PLACE_ORDER_TYPEHASH, trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit, nonce, deadline));
         _verify(trader, structHash, signature);
+
+        // ✅ SYNC : On enregistre aussi les ordres Limit/Stop
+        uint256 predictedId = core.nextTradeID() + 1;
+        traderTradeIds[trader].push(predictedId);
+
         core.placeOrder(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
@@ -181,6 +202,10 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint48 stopLoss,
         uint48 takeProfit
     ) external whenNotPaused {
+        // ✅ SYNC : Appel direct
+        uint256 predictedId = core.nextTradeID() + 1;
+        traderTradeIds[msg.sender].push(predictedId);
+
         core.placeOrder(msg.sender, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
@@ -273,34 +298,52 @@ contract BrokexPaymaster is Pausable, Ownable {
     }
 
     // =========================================================================
-    //                                7. BATCH VIEW HELPERS
+    //                                7. VIEW & PAGINATION
     // =========================================================================
-    // Ces fonctions appellent le Core pour lire les données sans stocker de logique ici.
 
+    /**
+     * @notice Récupère les trades d'un utilisateur avec pagination.
+     * @dev Lit la liste des IDs stockée dans le Paymaster, puis fetch les détails dans le Core.
+     * @param trader L'adresse du trader
+     * @param cursor L'index de départ dans la liste (ex: 0 pour le début)
+     * @param size Le nombre de trades voulus
+     * @return _trades La liste des structs Trade complets
+     * @return total Le nombre total de trades de l'utilisateur
+     */
+    function getTradesPagination(address trader, uint256 cursor, uint256 size) 
+        external 
+        view 
+        returns (IBrokexCore.Trade[] memory _trades, uint256 total) 
+    {
+        uint256[] memory ids = traderTradeIds[trader];
+        total = ids.length;
+
+        if (cursor >= total) {
+            return (new IBrokexCore.Trade[](0), total);
+        }
+
+        uint256 realSize = (cursor + size > total) ? (total - cursor) : size;
+        _trades = new IBrokexCore.Trade[](realSize);
+
+        for (uint256 i = 0; i < realSize; i++) {
+            // 1. Récupère l'ID depuis la liste locale du Paymaster
+            uint256 tradeId = ids[cursor + i];
+            // 2. Va chercher les données lourdes dans le Core
+            _trades[i] = core.trades(tradeId);
+        }
+        
+        return (_trades, total);
+    }
+
+    // Helper pour récupérer juste les états (utile pour le frontend qui veut refresh vite)
     function getTradeStatesFromList(uint256[] calldata tradeIds) external view returns (uint8[] memory states) {
         uint256 len = tradeIds.length;
         if (len > 1000) revert("List too long");
 
         states = new uint8[](len);
         for (uint256 i = 0; i < len; i++) {
-            // Lecture externe vers le Core
             IBrokexCore.Trade memory t = core.trades(tradeIds[i]);
             states[i] = t.state;
-        }
-    }
-
-    function getTradeSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
-        uint256 len = tradeIds.length;
-        if (len > 1000) revert("List too long");
-
-        stopLosses = new uint48[](len);
-        takeProfits = new uint48[](len);
-        
-        for (uint256 i = 0; i < len; i++) {
-            // Lecture externe vers le Core
-            IBrokexCore.Trade memory t = core.trades(tradeIds[i]);
-            stopLosses[i] = t.stopLoss;
-            takeProfits[i] = t.takeProfit;
         }
     }
 }
