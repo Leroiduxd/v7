@@ -297,41 +297,42 @@ contract BrokexPaymaster is Pausable, Ownable {
         core.addMargin(msg.sender, tradeId, amount6);
     }
 
+    // =========================================================================
+    //                                7. VIEW & PAGINATION
+    // =========================================================================
+
     /**
-     * @notice Récupère uniquement la liste des IDs de trades (Pagination légère)
+     * @notice Récupère les trades d'un utilisateur avec pagination.
+     * @dev Lit la liste des IDs stockée dans le Paymaster, puis fetch les détails dans le Core.
      * @param trader L'adresse du trader
-     * @param cursor L'index de départ (ex: 90 pour commencer au 90ème trade)
-     * @param size Le nombre d'IDs voulus (ex: 10)
-     * @return ids La liste des IDs (ex: [101, 102, 103...])
-     * @return total Le nombre total de trades de l'utilisateur (ex: 105)
+     * @param cursor L'index de départ dans la liste (ex: 0 pour le début)
+     * @param size Le nombre de trades voulus
+     * @return _trades La liste des structs Trade complets
+     * @return total Le nombre total de trades de l'utilisateur
      */
     function getTradesPagination(address trader, uint256 cursor, uint256 size) 
         external 
         view 
-        returns (uint256[] memory ids, uint256 total) 
+        returns (IBrokexCore.Trade[] memory _trades, uint256 total) 
     {
-        // 1. On récupère la liste complète stockée dans le Paymaster
-        uint256[] memory allIds = traderTradeIds[trader];
-        total = allIds.length;
+        uint256[] memory ids = traderTradeIds[trader];
+        total = ids.length;
 
-        // 2. Si on demande une page qui n'existe pas, on renvoie vide
         if (cursor >= total) {
-            return (new uint256[](0), total);
+            return (new IBrokexCore.Trade[](0), total);
         }
 
-        // 3. Calcul de la taille réelle du tableau à renvoyer
-        // Si on demande 10 mais qu'il n'en reste que 3, on renvoie 3.
         uint256 realSize = (cursor + size > total) ? (total - cursor) : size;
-        
-        // 4. Initialisation du tableau de résultats
-        ids = new uint256[](realSize);
+        _trades = new IBrokexCore.Trade[](realSize);
 
-        // 5. Remplissage (Copie simple des IDs)
         for (uint256 i = 0; i < realSize; i++) {
-            ids[i] = allIds[cursor + i];
+            // 1. Récupère l'ID depuis la liste locale du Paymaster
+            uint256 tradeId = ids[cursor + i];
+            // 2. Va chercher les données lourdes dans le Core
+            _trades[i] = core.trades(tradeId);
         }
         
-        return (ids, total);
+        return (_trades, total);
     }
 
     // Helper pour récupérer juste les états (utile pour le frontend qui veut refresh vite)
@@ -344,35 +345,5 @@ contract BrokexPaymaster is Pausable, Ownable {
             IBrokexCore.Trade memory t = core.trades(tradeIds[i]);
             states[i] = t.state;
         }
-    }
-    /**
-     * @notice Récupère les détails complets pour une liste spécifique d'IDs.
-     * @dev Utile pour "hydrater" les IDs récupérés via la pagination.
-     * @param tradeIds La liste des IDs voulus (ex: [103, 1304, 19304]).
-     * @return details Un tableau de structs Trade correspondant exactement à l'ordre des IDs fournis.
-     */
-    function getTradesDetails(uint256[] calldata tradeIds) 
-        external 
-        view 
-        returns (IBrokexCore.Trade[] memory details) 
-    {
-        uint256 len = tradeIds.length;
-        
-        // Sécurité anti-DDOS RPC : On évite de demander 10,000 trades d'un coup
-        if (len > 100) {
-            // Tu peux retirer cette ligne si tu veux, mais c'est mieux pour la stabilité du noeud
-            revert("Batch too large"); 
-        }
-
-        // On initialise le tableau de réponse avec la même taille
-        details = new IBrokexCore.Trade[](len);
-
-        for (uint256 i = 0; i < len; i++) {
-            // On appelle le Core pour chaque ID
-            // Si l'ID n'existe pas, le Core renverra un struct vide (tout à 0), ça ne plante pas.
-            details[i] = core.trades(tradeIds[i]);
-        }
-        
-        return details;
     }
 }
