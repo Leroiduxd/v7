@@ -345,4 +345,34 @@ contract BrokexPaymaster is Pausable, Ownable {
             states[i] = t.state;
         }
     }
+    /**
+     * @notice Récupère les détails complets pour une liste spécifique d'IDs.
+     * @dev Utile pour "hydrater" les IDs récupérés via la pagination.
+     * @param tradeIds La liste des IDs voulus (ex: [103, 1304, 19304]).
+     * @return details Un tableau de structs Trade correspondant exactement à l'ordre des IDs fournis.
+     */
+    function getTradesDetails(uint256[] calldata tradeIds) 
+        external 
+        view 
+        returns (IBrokexCore.Trade[] memory details) 
+    {
+        uint256 len = tradeIds.length;
+        
+        // Sécurité anti-DDOS RPC : On évite de demander 10,000 trades d'un coup
+        if (len > 100) {
+            // Tu peux retirer cette ligne si tu veux, mais c'est mieux pour la stabilité du noeud
+            revert("Batch too large"); 
+        }
+
+        // On initialise le tableau de réponse avec la même taille
+        details = new IBrokexCore.Trade[](len);
+
+        for (uint256 i = 0; i < len; i++) {
+            // On appelle le Core pour chaque ID
+            // Si l'ID n'existe pas, le Core renverra un struct vide (tout à 0), ça ne plante pas.
+            details[i] = core.trades(tradeIds[i]);
+        }
+        
+        return details;
+    }
 }
