@@ -483,29 +483,64 @@ contract BrokexCore {
         return (maxProfitLev < physProfit) ? maxProfitLev : physProfit;
     }
 
-    function calculateLiquidationPrice(uint256 tradeId) public view returns (uint256) {
+ // ✅ MODIFIÉ: Liquidation Dynamique (S'adapte à la Marge Restante et Lots Restants)
+    function calculateLiquidationPrice(uint256 tradeId) internal view returns (uint256) {
         Trade memory t = trades[tradeId];
         Asset memory a = assets[t.assetId];
         FundingState memory f = fundingStates[t.assetId];
 
-        uint256 openPrice = uint256(t.openPrice);
-        uint256 margin = _getNotionalValue(t.assetId, openPrice, uint32(t.lotSize)) / uint256(t.leverage);
-        uint256 liquidationLoss = (margin * 90) / 100; 
+        // 1. Récupérer la taille REELLE restante (Ce qui est encore ouvert)
+        int32 remainingLots = t.lotSize - t.closedLotSize;
+        if (remainingLots <= 0) return 0; // Trade déjà fermé ou vide
 
-        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(t.lotSize));
-        uint256 spreadCost = _getNotionalValue(t.assetId, spread, uint32(t.lotSize));
-        
+        // 2. Récupérer la Marge REELLE restante (Mise à jour par addMargin/closeTrade)
+        uint256 currentMargin6 = uint256(t.marginUsdc);
+
+        // 3. Calculer les frais accumulés (Funding + Weekend) sur la partie RESTANTE
+        // Funding Index actuel
         uint256 currentIdx = t.isLong ? f.longFundingIndex : f.shortFundingIndex;
-        uint256 fundingCost = (uint256(currentIdx) - uint256(t.fundingIndex)) * uint256(uint32(t.lotSize)) * uint256(a.numerator) / uint256(a.denominator);
-        uint256 weekendCost = calculateWeekendFunding(tradeId) * uint256(a.numerator) / uint256(a.denominator);
+        
+        // Funding Cost (sur remainingLots uniquement)
+        // Note: t.fundingIndex est le snapshot à l'ouverture.
+        // On multiplie par (current - snapshot) pour avoir le cumul par lot, puis par remainingLots.
+        uint256 fundingCostRaw = (uint256(currentIdx) - uint256(t.fundingIndex)) * uint256(uint32(remainingLots));
+        uint256 fundingCostUsdc = (fundingCostRaw * uint256(a.numerator)) / uint256(a.denominator);
 
-        uint256 totalLossAllowable = liquidationLoss + spreadCost + fundingCost + weekendCost;
-        uint256 deltaPrice = (totalLossAllowable * uint256(a.denominator)) / (uint256(uint32(t.lotSize)) * uint256(a.numerator));
+        // Weekend Cost (Prorata sur remainingLots)
+        // La fonction calculateWeekendFunding utilise t.lotSize (total) car elle se base sur l'historique,
+        // donc on fait une règle de 3 pour ne prendre que la part des lots restants.
+        uint256 totalWeekendRaw = calculateWeekendFunding(tradeId);
+        uint256 weekendCostRaw = (totalWeekendRaw * uint256(uint32(remainingLots))) / uint256(uint32(t.lotSize));
+        uint256 weekendCostUsdc = (weekendCostRaw * uint256(a.numerator)) / uint256(a.denominator);
 
+        // Spread Cost de fermeture (estimé) sur ce qu'il reste
+        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(remainingLots));
+        // Calcul de la valeur notionnelle du spread pour ces lots
+        uint256 spreadCostUsdc = (spread * uint256(uint32(remainingLots)) * uint256(a.numerator)) / uint256(a.denominator);
+
+        // 4. Calcul de la Perte Maximale Autorisée (Buffer)
+        // On définit la liquidation quand la perte latente + les frais mangent 90% de la marge restante.
+        uint256 maxEquityConsumption = (currentMargin6 * 90) / 100;
+        uint256 totalFees = fundingCostUsdc + weekendCostUsdc + spreadCostUsdc;
+
+        // Si les frais seuls dépassent déjà la sécurité, on liquide immédiatement (retourne prix d'ouverture pour forcer liq)
+        if (totalFees >= maxEquityConsumption) return uint256(t.openPrice);
+
+        // Le "Buffer PnL" est ce qu'il reste de la marge pour absorber les mouvements de prix pur
+        uint256 pnlBufferUsdc = maxEquityConsumption - totalFees;
+
+        // 5. Conversion du Buffer USDC en Distance Prix
+        // Formule PnL = DeltaPrice * Lots * Num / Den
+        // Donc : DeltaPrice = (PnL_Buffer * Den) / (Lots * Num)
+        uint256 deltaPrice = (pnlBufferUsdc * uint256(a.denominator)) / (uint256(uint32(remainingLots)) * uint256(a.numerator));
+
+        // 6. Calcul du Prix Final
         if (t.isLong) {
-            return (deltaPrice >= openPrice) ? 0 : openPrice - deltaPrice;
+            // Pour un Long, on est liquidé si le prix descend : Entry - Delta
+            return (deltaPrice >= uint256(t.openPrice)) ? 0 : uint256(t.openPrice) - deltaPrice;
         } else {
-            return openPrice + deltaPrice;
+            // Pour un Short, on est liquidé si le prix monte : Entry + Delta
+            return uint256(t.openPrice) + deltaPrice;
         }
     }
 
