@@ -82,6 +82,9 @@ contract BrokexCore {
     address public immutable owner;
     
     address public paymaster;
+    
+    // ✅ AJOUT : Variable publique pour afficher l'adresse de la librairie liée
+    address public libraryAddress;
 
     uint256 public nextTradeID;
     uint256 public listedAssetsCount;
@@ -117,10 +120,15 @@ contract BrokexCore {
     modifier onlyOwner() { if (msg.sender != owner) revert NotOwner(); _; }
     modifier onlyPaymaster() { if (msg.sender != paymaster) revert NotPaymaster(); _; }
 
-    constructor(address _oracle) {
+    // ✅ MODIFICATION : Le constructeur prend l'adresse de la librairie en argument
+    constructor(address _oracle, address _libraryAddress) {
         owner = msg.sender;
         oracle = ISupraOraclePull(_oracle);
         currentSeasonId = 1; 
+        
+        // On sauvegarde l'adresse pour qu'elle soit visible sur Etherscan
+        require(_libraryAddress != address(0), "Zero Address for Lib");
+        libraryAddress = _libraryAddress;
     }
 
     function setBrokexVault(address vault) external onlyOwner {
@@ -369,9 +377,9 @@ contract BrokexCore {
         t.openTimestamp = uint32(block.timestamp);
         BrokexLibrary.FundingState memory fs = fundingStates[assetId];
         t.fundingIndex = isLong ? fs.longFundingIndex : fs.shortFundingIndex;
-        t.closePrice = 0;          
+        t.closePrice = 0;           
         t.lotSize = lotSize; 
-        t.closedLotSize = 0;       
+        t.closedLotSize = 0;        
         t.stopLoss = stopLoss; 
         t.takeProfit = takeProfit;
         t.lpLockedCapital = uint64(lpLocked6); 
@@ -560,8 +568,8 @@ contract BrokexCore {
         }
 
         t.closedLotSize += lotsToClose; 
-        t.marginUsdc -= uint64(marginToRelease);       
-        t.lpLockedCapital -= uint64(lpToRelease);      
+        t.marginUsdc -= uint64(marginToRelease);        
+        t.lpLockedCapital -= uint64(lpToRelease);       
 
         bool isFullClose = (t.closedLotSize >= t.lotSize);
         if (isFullClose) {
@@ -673,5 +681,31 @@ contract BrokexCore {
         }
 
         _finalizeClose(t, price1e6, tradeId, remaining);
+    }
+
+    // ----------------------------------------------------------------
+    // 13. FRONTEND HELPERS (WRAPPERS)
+    // ✅ AJOUT : Fonctions de lecture pour le site web
+    // ----------------------------------------------------------------
+
+    function calculateSpread(uint32 assetId, bool isLong, bool isOpening, uint32 lotSize) external view returns (uint256) {
+        return BrokexLibrary.calculateSpread(assets[assetId], exposures[assetId], isLong, isOpening, lotSize);
+    }
+
+    function calculateWeekendFunding(uint256 tradeId) external view returns (uint256) {
+        BrokexLibrary.Trade storage t = trades[tradeId];
+        return BrokexLibrary.calculateWeekendFunding(t, assets[t.assetId], block.timestamp);
+    }
+
+    function calculateMargin6(uint32 assetId, uint256 entryPrice, uint32 lotSize, uint8 leverage) external view returns (uint256) {
+        return BrokexLibrary.calculateMargin6(assets[assetId], entryPrice, lotSize, leverage);
+    }
+
+    function calculateLockedCapital(uint32 assetId, uint256 entryPrice, uint32 lotSize, uint8 leverage) external view returns (uint256) {
+        return BrokexLibrary.calculateLockedCapital(assets[assetId], entryPrice, lotSize, leverage);
+    }
+
+    function validateStops(uint256 entryPrice, bool isLong, uint256 stopLoss, uint256 takeProfit) external pure returns (bool, string memory) {
+        return BrokexLibrary.validateStops(entryPrice, isLong, stopLoss, takeProfit);
     }
 }
