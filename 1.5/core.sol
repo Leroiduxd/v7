@@ -2,14 +2,14 @@
 pragma solidity ^0.8.19;
 
 /*
-    BROKEX CORE V22 (LIMIT & STOP ORDERS)
+    BROKEX CORE V22.2 (LIMIT & STOP ORDERS + WAD SPREAD)
     - Logic: Full V21 Base (Airdrop, Paymaster, Oracle Batch).
     - Feature: Added 'isLimit' flag to Orders.
     - Execution: 
         * Limit: Buy Low / Sell High (Reversal)
         * Stop: Buy High / Sell Low (Breakout)
-    - ✅ V22.1 UPDATE: Funding Rate & Weekend Rate are now continuous percentages (WAD) 
-      with Lazy Update mechanism (auto-updates on every trade action).
+    - ✅ V22.1 UPDATE: Funding Rate & Weekend Rate are continuous percentages (WAD) with Lazy Update.
+    - ✅ V22.2 UPDATE: Spread is now a continuous percentage (WAD) applied dynamically to the price. Admin setters added.
 */
 
 // ==========================================
@@ -142,7 +142,7 @@ contract BrokexCore {
         uint32 numerator;       
         uint32 denominator;     
         uint32 baseFundingRate; // ✅ WAD: Pourcentage Horaire (ex: 1e14 pour 0.01%)
-        uint32 spread;
+        uint32 spread;          // ✅ WAD: Pourcentage WAD désormais
         uint32 commission;
         uint32 weekendFunding;  // ✅ WAD: Pourcentage par weekend (ex: 5e14 pour 0.05%)
         uint16 securityMultiplier;
@@ -304,6 +304,27 @@ contract BrokexCore {
         listedAssetsCount++;
     }
 
+    // ✅ NOUVELLES FONCTIONS D'ADMINISTRATION POUR AJUSTER LES ASSETS EN DIRECT
+    function setAssetFees(uint32 assetId, uint32 newSpreadWad, uint32 newCommissionPPM) external onlyOwner {
+        if (!assets[assetId].listed) revert UnknownAsset();
+        assets[assetId].spread = newSpreadWad;
+        assets[assetId].commission = newCommissionPPM;
+    }
+
+    function setAssetFundingRates(uint32 assetId, uint32 newBaseFundingWad, uint32 newWeekendFundingWad) external onlyOwner {
+        if (!assets[assetId].listed) revert UnknownAsset();
+        _updateFundingRate(assetId); // IMPORTANT: Mettre à jour l'index avant de changer le taux
+        assets[assetId].baseFundingRate = newBaseFundingWad;
+        assets[assetId].weekendFunding = newWeekendFundingWad;
+    }
+
+    function setAssetRiskParams(uint32 assetId, uint16 newSecMult, uint16 newMaxPhys, uint8 newMaxLev) external onlyOwner {
+        if (!assets[assetId].listed) revert UnknownAsset();
+        assets[assetId].securityMultiplier = newSecMult;
+        assets[assetId].maxPhysicalMove = newMaxPhys;
+        assets[assetId].maxLeverage = newMaxLev;
+    }
+
     function setAssetOracleDelay(uint32 assetId, uint32 newDelay) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
         if (newDelay < 15) revert DelayTooShort();
@@ -421,10 +442,11 @@ contract BrokexCore {
         return (true, "");
     }
 
+    // ✅ MODIFIÉ: Renvoie le Spread sous forme de Multiplicateur WAD (ex: 1e15 pour 0.1%)
     function calculateSpread(uint32 assetId, bool isLong, bool isOpening, uint32 lotSize) public view returns (uint256) {
         Asset memory a = assets[assetId];
         Exposure memory e = exposures[assetId];
-        uint256 base = uint256(a.spread);
+        uint256 base = uint256(a.spread); // Ce base est maintenant un % WAD
         
         int256 L = int256(e.longLots);
         int256 S = int256(e.shortLots);
@@ -445,7 +467,6 @@ contract BrokexCore {
         return dominant ? (base * (1e18 + 3 * p)) / 1e18 : base;
     }
 
-    // ✅ MODIFIÉ: Renvoie un POURCENTAGE WAD cumulé (ex: n weekends * % weekendFunding)
     function calculateWeekendFunding(uint256 tradeId) public view returns (uint256) {
         Trade memory t = trades[tradeId];
         Asset memory a = assets[t.assetId];
@@ -462,7 +483,6 @@ contract BrokexCore {
         if (currentWeek <= openWeek) return 0;
         uint256 weekendsCrossed = currentWeek - openWeek;
         
-        // Retourne le pourcentage WAD total accumulé
         return weekendsCrossed * uint256(a.weekendFunding);
     }
 
@@ -482,7 +502,6 @@ contract BrokexCore {
         return (maxProfitLev < physProfit) ? maxProfitLev : physProfit;
     }
 
-    // ✅ MODIFIÉ: Liquidation Dynamique avec le calcul en Pourcentage
     function calculateLiquidationPrice(uint256 tradeId) internal view returns (uint256) {
         Trade memory t = trades[tradeId];
         Asset memory a = assets[t.assetId];
@@ -493,25 +512,21 @@ contract BrokexCore {
 
         uint256 currentMargin6 = uint256(t.marginUsdc);
 
-        // ✅ Index et frais en WAD
         uint256 currentIdx = t.isLong ? f.longFundingIndex : f.shortFundingIndex;
         uint256 deltaIndex = currentIdx - t.fundingIndex;
         
-        // Valeur Notionnelle de base pour la liquidation
         uint256 baseNotional6 = (uint256(t.openPrice) * uint256(uint32(remainingLots)) * uint256(a.numerator)) / uint256(a.denominator);
         
-        // Frais Funding = Notionnel * % accumulé / 1e18
         uint256 fundingCostUsdc = (baseNotional6 * deltaIndex) / 1e18;
 
-        // Frais Weekend = Notionnel * % weekend / 1e18
         uint256 weekendPercent = calculateWeekendFunding(tradeId);
         uint256 weekendCostUsdc = (baseNotional6 * weekendPercent) / 1e18;
 
-        // Spread Cost
-        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(remainingLots));
-        uint256 spreadCostUsdc = (spread * uint256(uint32(remainingLots)) * uint256(a.numerator)) / uint256(a.denominator);
+        // ✅ MODIFIÉ: Le calcul du coût de Spread via le WAD Percentage
+        uint256 spreadWad = calculateSpread(t.assetId, !t.isLong, false, uint32(remainingLots));
+        uint256 spreadAmount = (uint256(t.openPrice) * spreadWad) / 1e18; // Estimation basée sur l'open price
+        uint256 spreadCostUsdc = (spreadAmount * uint256(uint32(remainingLots)) * uint256(a.numerator)) / uint256(a.denominator);
 
-        // Capacité maximale de perte
         uint256 maxEquityConsumption = (currentMargin6 * 90) / 100;
         uint256 totalFees = fundingCostUsdc + weekendCostUsdc + spreadCostUsdc;
 
@@ -531,16 +546,11 @@ contract BrokexCore {
     // 7. FUNDING RATE
     // ----------------------------------------------------------------
 
-
-
-    // ✅ MODIFIÉ: Lazy Update. Transforme le taux horaire quadratique en index par seconde.
     function _updateFundingRate(uint32 assetId) internal {
         FundingState storage f = fundingStates[assetId];
         
-        // Évite les doubles mises à jour dans le même bloc
         if (block.timestamp <= f.lastUpdate) return;
         
-        // Initialisation de la première horloge (évite de facturer depuis 1970 au 1er trade)
         if (f.lastUpdate == 0) {
             f.lastUpdate = uint64(block.timestamp);
             return;
@@ -552,13 +562,10 @@ contract BrokexCore {
         uint256 L = uint256(int256(e.longLots) > 0 ? uint256(int256(e.longLots)) : 0);
         uint256 S = uint256(int256(e.shortLots) > 0 ? uint256(int256(e.shortLots)) : 0);
         
-        // baseFundingRate est maintenant un pourcentage WAD (ex: 1e14 pour 0.01%)
         uint256 baseFunding = uint256(a.baseFundingRate);
 
-        // Formule quadratique conservée à 100%
         (uint256 longRateHourly, uint256 shortRateHourly) = _computeFundingRateQuadratic(L, S, baseFunding);
 
-        // Calcul exact par seconde écoulée
         uint256 timePassed = block.timestamp - f.lastUpdate;
         f.longFundingIndex += uint128((longRateHourly * timePassed) / 3600);
         f.shortFundingIndex += uint128((shortRateHourly * timePassed) / 3600);
@@ -588,12 +595,14 @@ contract BrokexCore {
         if (lotSize <= 0) revert BadSize();
         if (!_isRoundLeverage(leverage)) revert BadLev();
 
-        // ✅ AUTO-UPDATE: On met à jour l'index AVANT de prendre la photo
         _updateFundingRate(assetId);
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, assetId);
-        uint256 spread = calculateSpread(assetId, isLong, true, uint32(lotSize));
-        uint256 entryPrice = isLong ? price1e6 + spread : price1e6 - spread;
+        
+        // ✅ MODIFIÉ: Conversion du Spread WAD en Valeur Absolue
+        uint256 spreadWad = calculateSpread(assetId, isLong, true, uint32(lotSize));
+        uint256 spreadAmount = (price1e6 * spreadWad) / 1e18;
+        uint256 entryPrice = isLong ? price1e6 + spreadAmount : price1e6 - spreadAmount;
 
         (bool stopsOk, string memory reason) = validateStops(entryPrice, isLong, stopLoss, takeProfit);
         if(!stopsOk) revert(reason);
@@ -605,30 +614,25 @@ contract BrokexCore {
         uint256 tradeId = ++nextTradeID;
         Trade storage t = trades[tradeId];
         
-        // Slot 0
         t.trader = trader; 
         t.assetId = assetId; 
         t.isLong = isLong; 
         t.isLimit = false; 
         t.leverage = leverage; 
         
-        // Slot 1
         t.openPrice = uint48(entryPrice); 
         t.state = 1; 
         t.openTimestamp = uint32(block.timestamp);
         
-        // ✅ SNAPSHOT DE L'INDEX FRAIS
         FundingState memory fs = fundingStates[assetId];
         t.fundingIndex = isLong ? fs.longFundingIndex : fs.shortFundingIndex;
         
-        // Slot 2
         t.closePrice = 0;          
         t.lotSize = lotSize; 
         t.closedLotSize = 0;       
         t.stopLoss = stopLoss; 
         t.takeProfit = takeProfit;
         
-        // Slot 3
         t.lpLockedCapital = uint64(lpLocked6); 
         t.marginUsdc = uint64(margin6);
 
@@ -661,7 +665,7 @@ contract BrokexCore {
             openPrice: targetPrice, 
             state: 0, 
             openTimestamp: uint32(block.timestamp), 
-            fundingIndex: 0, // Un ordre pending ne paye pas de frais
+            fundingIndex: 0, 
             closePrice: 0, 
             lotSize: lotSize, 
             closedLotSize: 0, 
@@ -680,7 +684,6 @@ contract BrokexCore {
         if (t.state != 0) revert NotPending();
         if (!assets[t.assetId].allowOpen) revert CloseOnlyMode();
 
-        // ✅ AUTO-UPDATE: Avant ouverture réelle
         _updateFundingRate(t.assetId);
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
@@ -694,14 +697,15 @@ contract BrokexCore {
         
         if (!executable) revert PriceBad();
 
-        uint256 spread = calculateSpread(t.assetId, t.isLong, true, uint32(t.lotSize));
-        uint256 execPrice = t.isLong ? price1e6 + spread : price1e6 - spread;
+        // ✅ MODIFIÉ: Conversion du Spread WAD en Valeur Absolue
+        uint256 spreadWad = calculateSpread(t.assetId, t.isLong, true, uint32(t.lotSize));
+        uint256 spreadAmount = (price1e6 * spreadWad) / 1e18;
+        uint256 execPrice = t.isLong ? price1e6 + spreadAmount : price1e6 - spreadAmount;
 
         t.openPrice = uint48(execPrice); 
         t.state = 1; 
         t.openTimestamp = uint32(block.timestamp);
         
-        // ✅ SNAPSHOT
         FundingState memory fs = fundingStates[t.assetId];
         t.fundingIndex = t.isLong ? fs.longFundingIndex : fs.shortFundingIndex;
 
@@ -718,7 +722,6 @@ contract BrokexCore {
         if (t.trader != trader) revert NotYourTrade();
         if (t.state != 1) revert NotOpen();
 
-        // ✅ AUTO-UPDATE: Mettre l'index à jour juste avant de facturer !
         _updateFundingRate(t.assetId);
 
         int32 remaining = t.lotSize - t.closedLotSize;
@@ -734,7 +737,6 @@ contract BrokexCore {
         Trade storage t = trades[tradeId];
         if (t.state != 1) revert NotOpen();
         
-        // ✅ AUTO-UPDATE: Essentiel pour que calculateLiquidationPrice ait les bonnes infos
         _updateFundingRate(t.assetId);
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
@@ -760,7 +762,6 @@ contract BrokexCore {
         Trade storage t = trades[tradeId];
         if (t.state != 1) revert NotOpen();
         
-        // ✅ AUTO-UPDATE
         _updateFundingRate(t.assetId);
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
@@ -846,38 +847,35 @@ contract BrokexCore {
         emit TradeEvent(tradeId, 2);
     }
 
-    // ✅ MODIFIÉ: Logique de financement en Pourcentage (% * Notionnel de sortie)
     function _calculateNetPnl(Trade storage t, uint256 price1e6, uint256 tradeId, int32 sizeToCalc) internal view returns (int256) {
-        uint256 spread = calculateSpread(t.assetId, !t.isLong, false, uint32(sizeToCalc));
+        // ✅ MODIFIÉ: Conversion du Spread WAD en Valeur Absolue de sortie
+        uint256 spreadWad = calculateSpread(t.assetId, !t.isLong, false, uint32(sizeToCalc));
+        uint256 spreadAmount = (price1e6 * spreadWad) / 1e18;
+        
         uint256 exitPrice;
         if (t.isLong) {
-            if (spread > price1e6) exitPrice = 0; else exitPrice = price1e6 - spread;
+            if (spreadAmount > price1e6) exitPrice = 0; else exitPrice = price1e6 - spreadAmount;
         } else {
-            exitPrice = price1e6 + spread;
+            exitPrice = price1e6 + spreadAmount;
         }
 
         int256 delta = t.isLong ? int256(exitPrice) - int256(uint256(t.openPrice)) : int256(uint256(t.openPrice)) - int256(exitPrice);
         Asset memory a = assets[t.assetId];
         
         int256 lotSize256 = int256(uint256(uint32(sizeToCalc)));
-        // PnL Brut converti directement en 1e18 (WAD)
         int256 rawPnl18 = (delta * lotSize256 * int256(uint256(a.numerator)) * 1e12) / int256(uint256(a.denominator));
         
         FundingState memory fs = fundingStates[t.assetId];
         uint256 currentIdx = t.isLong ? fs.longFundingIndex : fs.shortFundingIndex;
-        uint256 deltaIndex = currentIdx - t.fundingIndex; // En WAD (1e18)
+        uint256 deltaIndex = currentIdx - t.fundingIndex; 
         
-        // Notionnel à la sortie (en 1e6)
         uint256 exitNotional6 = (exitPrice * uint256(uint32(sizeToCalc)) * uint256(a.numerator)) / uint256(a.denominator);
         
-        // Calcul Frais de Funding: Notionnel * Pourcentage
         uint256 fundingPaidUsdc = (exitNotional6 * deltaIndex) / 1e18;
         
-        // Calcul Frais Weekend: Notionnel * Pourcentage Weekend
         uint256 weekendPercentTotal = calculateWeekendFunding(tradeId); 
         uint256 weekendFeesFinal = (exitNotional6 * weekendPercentTotal) / 1e18;
 
-        // Soustraction des frais (ramenés en 1e18 pour matcher rawPnl18)
         return rawPnl18 - int256((fundingPaidUsdc + weekendFeesFinal) * 1e12);
     }
 
@@ -996,7 +994,6 @@ contract BrokexCore {
         Trade storage t = trades[tradeId];
         if (t.state != 1) revert NotOpen();
 
-        // ✅ AUTO-UPDATE
         _updateFundingRate(t.assetId);
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
