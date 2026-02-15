@@ -29,14 +29,14 @@ library BrokexLibrary {
         uint64 marginUsdc;      
     }
 
-    struct Asset {
+  struct Asset {
         uint32 assetId;
         uint32 numerator;       
         uint32 denominator;     
-        uint32 baseFundingRate; // ✅ WAD: Pourcentage Horaire (ex: 1e14)
-        uint32 spread;          // ✅ WAD: Pourcentage WAD (ex: 1e15 pour 0.1%)
-        uint32 commission;
-        uint32 weekendFunding;  // ✅ WAD: Pourcentage par weekend (ex: 5e14)
+        uint64 baseFundingRate; // ✅ Changé en uint64 (WAD)
+        uint64 spread;          // ✅ Changé en uint64 (WAD)
+        uint32 commission;      // Gardé en uint32 (C'est en points, max 10000)
+        uint64 weekendFunding;  // ✅ Changé en uint64 (WAD)
         uint16 securityMultiplier;
         uint16 maxPhysicalMove;
         uint8  maxLeverage;
@@ -482,20 +482,20 @@ contract BrokexCore {
     // 4. ADMIN & ASSET
     // ----------------------------------------------------------------
 
-    function listAsset(uint32 assetId, uint32 numerator, uint32 denominator, uint32 baseFundingRate, uint32 spread, uint32 commission, uint32 weekendFunding, uint16 securityMultiplier, uint16 maxPhysicalMove, uint8 maxLeverage) external onlyOwner {
+    function listAsset(uint32 assetId, uint32 numerator, uint32 denominator, uint64 baseFundingRate, uint64 spread, uint32 commission, uint64 weekendFunding, uint16 securityMultiplier, uint16 maxPhysicalMove, uint8 maxLeverage) external onlyOwner {
         if (assets[assetId].listed) revert AlreadyListed();
         if (numerator == 0 || denominator == 0) revert BadRatio();
         assets[assetId] = BrokexLibrary.Asset({assetId: assetId, numerator: numerator, denominator: denominator, baseFundingRate: baseFundingRate, spread: spread, commission: commission, weekendFunding: weekendFunding, securityMultiplier: securityMultiplier, maxPhysicalMove: maxPhysicalMove, maxLeverage: maxLeverage, maxLongLots: 1000000, maxShortLots: 1000000, maxOracleDelay: 60, allowOpen: true, listed: true});
         listedAssetsCount++;
     }
 
-    function setAssetFees(uint32 assetId, uint32 newSpreadWad, uint32 newCommissionPPM) external onlyOwner {
+    function setAssetFees(uint32 assetId, uint64 newSpreadWad, uint32 newCommission) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
         assets[assetId].spread = newSpreadWad;
-        assets[assetId].commission = newCommissionPPM;
+        assets[assetId].commission = newCommission;
     }
 
-    function setAssetFundingRates(uint32 assetId, uint32 newBaseFundingWad, uint32 newWeekendFundingWad) external onlyOwner {
+    function setAssetFundingRates(uint32 assetId, uint64 newBaseFundingWad, uint64 newWeekendFundingWad) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
         _updateFundingRate(assetId); 
         assets[assetId].baseFundingRate = newBaseFundingWad;
