@@ -615,7 +615,9 @@ contract BrokexVault {
             require(block.timestamp >= tsCore, "PnL in future?");
             require(block.timestamp - tsCore <= 120, "PnL stale (>2min)");
             
-            unrealizedPnlTraders18 = pnlCore;
+            // ✅ Conversion 1e6 (core) -> 1e18 (WAD) pour être cohérent avec le vault
+            // 1e18 / 1e6 = 1e12
+            unrealizedPnlTraders18 = pnlCore * int256(1e12);
         }
 
         // --- À PARTIR D'ICI, LE RESTE DE LA LOGIQUE EST IDENTIQUE ---
@@ -723,6 +725,7 @@ contract BrokexVault {
         
         emit EpochRolled(e, currentEpoch, priceWad, equity18, deposits6, sharesMinted18);
     }
+
 
     function processWithdrawals(uint256 maxSteps) external {
         require(maxSteps > 0, "steps=0");
