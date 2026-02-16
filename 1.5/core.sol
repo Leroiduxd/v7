@@ -352,19 +352,7 @@ contract BrokexCore {
 
     uint256 public nextTradeID;
     uint256 public listedAssetsCount;
-
-    // --- AIRDROP STATE ---
-    uint32 public currentSeasonId;
-    
-    mapping(uint32 => mapping(address => uint256)) public seasonTraderVolume;
-    mapping(uint32 => uint256) public seasonTotalVolume;
-    
-    mapping(uint32 => mapping(address => uint256)) public seasonTraderWinPnL;
-    mapping(uint32 => uint256) public seasonTotalWinPnL;
-
-    event SeasonRotated(uint32 newSeasonId);
-    event AirdropPoints(uint32 indexed seasonId, address indexed trader, uint256 volumePoints, uint256 pnlPoints);
-
+  
     // Mappings using Structs from Library
     mapping(uint256 => BrokexLibrary.Trade) public trades;
     mapping(uint32 => BrokexLibrary.Asset) public assets;
@@ -387,7 +375,6 @@ contract BrokexCore {
     constructor(address _oracle, address _libraryAddress) {
         owner = msg.sender;
         oracle = ISupraOraclePull(_oracle);
-        currentSeasonId = 1; 
         
         require(_libraryAddress != address(0), "Zero Address for Lib");
         libraryAddress = _libraryAddress;
@@ -402,34 +389,6 @@ contract BrokexCore {
         require(paymaster == address(0), "PAYMASTER_ALREADY_SET");
         if (_paymaster == address(0)) revert ZeroAddr();
         paymaster = _paymaster;
-    }
-
-    // ----------------------------------------------------------------
-    // 2. AIRDROP LOGIC & VIEWS
-    // ----------------------------------------------------------------
-
-    function startNewSeason() external onlyOwner {
-        currentSeasonId++;
-        emit SeasonRotated(currentSeasonId);
-    }
-
-    function _updateAirdropVolume(address trader, uint256 margin6) internal {
-        seasonTraderVolume[currentSeasonId][trader] += margin6;
-        seasonTotalVolume[currentSeasonId] += margin6;
-        emit AirdropPoints(currentSeasonId, trader, margin6, 0);
-    }
-
-    function _updateAirdropPnL(address trader, int256 pnl18) internal {
-        if (pnl18 > 0) {
-            uint256 profit6 = uint256(pnl18) / 1e12; 
-            seasonTraderWinPnL[currentSeasonId][trader] += profit6;
-            seasonTotalWinPnL[currentSeasonId] += profit6;
-            emit AirdropPoints(currentSeasonId, trader, 0, profit6);
-        }
-    }
-
-    function isSeasonFinished(uint32 seasonId) external view returns (bool) {
-        return seasonId < currentSeasonId;
     }
 
     // ----------------------------------------------------------------
@@ -684,7 +643,6 @@ contract BrokexCore {
         _updateExposure(assetId, lotSize, uint48(entryPrice), isLong, true);
         _updateExposureLimits(assetId, uint64(lpLocked6), uint64(margin6), isLong, true);
         
-        _updateAirdropVolume(trader, uint256(margin6));
         brokexVault.createPosition(tradeId, trader, margin6, commission6, lpLocked6);
         emit TradeEvent(tradeId, 1);
     }
@@ -756,7 +714,6 @@ contract BrokexCore {
 
         _updateExposure(t.assetId, t.lotSize, uint48(execPrice), t.isLong, true);
         _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, true);
-        _updateAirdropVolume(t.trader, uint256(t.marginUsdc));
 
         brokexVault.executeOrder(tradeId);
         emit TradeEvent(tradeId, 1);
@@ -861,8 +818,6 @@ contract BrokexCore {
         if (isFullClose) {
             t.state = 2; 
         }
-
-        _updateAirdropPnL(t.trader, netPnl);
         
         brokexVault.closeTrade(tradeId, netPnl, marginToRelease, lpToRelease, isFullClose);
         
