@@ -21,7 +21,7 @@ interface IBrokexCore {
         uint128 fundingIndex;
         uint48 closePrice;       
         int32 lotSize;
-        int32 closedLotSize; // Mis à jour avec ton dernier struct
+        int32 closedLotSize; 
         uint48 stopLoss;
         uint48 takeProfit;
         uint64 lpLockedCapital;
@@ -37,13 +37,12 @@ interface IBrokexCore {
     // --- Fonctions d'écriture ---
     function openMarketPosition(address trader, uint32 assetId, bool isLong, uint8 leverage, int32 lotSize, uint48 stopLoss, uint48 takeProfit, bytes calldata oracleProof) external;
     function placeOrder(address trader, uint32 assetId, bool isLong, bool isLimit, uint8 leverage, int32 lotSize, uint48 targetPrice, uint48 stopLoss, uint48 takeProfit) external;
-    function closePositionMarket(address trader, uint256 tradeId, int32 lotsToClose, bytes calldata oracleProof) external; // Mis à jour avec lotsToClose
+    function closePositionMarket(address trader, uint256 tradeId, int32 lotsToClose, bytes calldata oracleProof) external;
     function updateSLTP(address trader, uint256 tradeId, uint48 newSL, uint48 newTP) external;
     function cancelOrder(address trader, uint256 tradeId) external;
     function addMargin(address trader, uint256 tradeId, uint64 amount6) external;
 
     // --- Getters Automatiques des Mappings Publics du Core ---
-    // Ces signatures correspondent aux mappings "public" définis dans le Core.
     
     function exposures(uint32 assetId) external view returns (
         int32 longLots, int32 shortLots, uint128 longValueSum, uint128 shortValueSum,
@@ -56,17 +55,12 @@ interface IBrokexCore {
         uint16 maxPhysicalMove, uint8 maxLeverage, uint32 maxLongLots, uint32 maxShortLots,
         uint32 maxOracleDelay, bool allowOpen, bool listed
     );
-
-    function seasonTraderVolume(uint32 seasonId, address trader) external view returns (uint256);
-    function seasonTraderWinPnL(uint32 seasonId, address trader) external view returns (uint256);
-    function seasonTotalVolume(uint32 seasonId) external view returns (uint256);
-    function seasonTotalWinPnL(uint32 seasonId) external view returns (uint256);
     
-    // ✅ AJOUT : Pour lire l'état du funding
+    // Pour lire l'état du funding
     function fundingStates(uint32 assetId) external view returns (uint64 lastUpdate, uint128 longFundingIndex, uint128 shortFundingIndex);
 }
 
-/* ────────────────────────── Brokex Paymaster V4.5 (Relay + List Manager + Lens) ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V4.7 (Relay + Lens - Off-Chain DB Ready) ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
@@ -76,9 +70,6 @@ contract BrokexPaymaster is Pausable, Ownable {
     bytes32 public immutable DOMAIN_SEPARATOR; 
     
     mapping(address => uint256) public nonces;
-
-    // Liste des IDs de trades par trader
-    mapping(address => uint256[]) public traderTradeIds;
 
     // ───────────── TypeHashes ─────────────
 
@@ -163,9 +154,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         bytes32 structHash = keccak256(abi.encode(OPEN_MARKET_TYPEHASH, trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, nonce, deadline));
         _verify(trader, structHash, signature);
 
-        uint256 predictedId = core.nextTradeID() + 1;
-        traderTradeIds[trader].push(predictedId);
-
         core.openMarketPosition(trader, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
@@ -178,9 +166,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint48 takeProfit,
         bytes calldata oracleProof
     ) external whenNotPaused {
-        uint256 predictedId = core.nextTradeID() + 1;
-        traderTradeIds[msg.sender].push(predictedId);
-
         core.openMarketPosition(msg.sender, assetId, isLong, leverage, lotSize, stopLoss, takeProfit, oracleProof);
     }
 
@@ -206,9 +191,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         bytes32 structHash = keccak256(abi.encode(PLACE_ORDER_TYPEHASH, trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit, nonce, deadline));
         _verify(trader, structHash, signature);
 
-        uint256 predictedId = core.nextTradeID() + 1;
-        traderTradeIds[trader].push(predictedId);
-
         core.placeOrder(trader, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
@@ -222,14 +204,11 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint48 stopLoss,
         uint48 takeProfit
     ) external whenNotPaused {
-        uint256 predictedId = core.nextTradeID() + 1;
-        traderTradeIds[msg.sender].push(predictedId);
-
         core.placeOrder(msg.sender, assetId, isLong, isLimit, leverage, lotSize, targetPrice, stopLoss, takeProfit);
     }
 
     // =========================================================================
-    //                                3. CLOSE MARKET (Updated Partial)
+    //                                3. CLOSE MARKET
     // =========================================================================
 
     function executeCloseMarket(
@@ -242,9 +221,9 @@ contract BrokexPaymaster is Pausable, Ownable {
     ) external whenNotPaused {
         _checkDeadline(deadline);
         uint256 nonce = _useNonce(trader);
-        // Note: j'ai ajouté lotsToClose au hash pour la sécurité
         bytes32 structHash = keccak256(abi.encode(CLOSE_MARKET_TYPEHASH, trader, tradeId, lotsToClose, nonce, deadline));
         _verify(trader, structHash, signature);
+        
         core.closePositionMarket(trader, tradeId, lotsToClose, oracleProof);
     }
 
@@ -268,6 +247,7 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint256 nonce = _useNonce(trader);
         bytes32 structHash = keccak256(abi.encode(UPDATE_SLTP_TYPEHASH, trader, tradeId, newSL, newTP, nonce, deadline));
         _verify(trader, structHash, signature);
+        
         core.updateSLTP(trader, tradeId, newSL, newTP);
     }
 
@@ -289,6 +269,7 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint256 nonce = _useNonce(trader);
         bytes32 structHash = keccak256(abi.encode(CANCEL_ORDER_TYPEHASH, trader, tradeId, nonce, deadline));
         _verify(trader, structHash, signature);
+        
         core.cancelOrder(trader, tradeId);
     }
 
@@ -311,6 +292,7 @@ contract BrokexPaymaster is Pausable, Ownable {
         uint256 nonce = _useNonce(trader);
         bytes32 structHash = keccak256(abi.encode(ADD_MARGIN_TYPEHASH, trader, tradeId, amount6, nonce, deadline));
         _verify(trader, structHash, signature);
+        
         core.addMargin(trader, tradeId, amount6);
     }
 
@@ -319,32 +301,12 @@ contract BrokexPaymaster is Pausable, Ownable {
     }
 
     // =========================================================================
-    //                                7. VIEW & PAGINATION
+    //              7. VIEWS UTILITAIRES (Pour le Fetching de masse)
     // =========================================================================
 
-    function getTradesPagination(address trader, uint256 cursor, uint256 size) 
-        external 
-        view 
-        returns (IBrokexCore.Trade[] memory _trades, uint256 total) 
-    {
-        uint256[] memory ids = traderTradeIds[trader];
-        total = ids.length;
-
-        if (cursor >= total) {
-            return (new IBrokexCore.Trade[](0), total);
-        }
-
-        uint256 realSize = (cursor + size > total) ? (total - cursor) : size;
-        _trades = new IBrokexCore.Trade[](realSize);
-
-        for (uint256 i = 0; i < realSize; i++) {
-            uint256 tradeId = ids[cursor + i];
-            _trades[i] = core.trades(tradeId);
-        }
-        
-        return (_trades, total);
-    }
-
+    /**
+     * @notice Récupère uniquement les états (state) d'une liste de trades.
+     */
     function getTradeStatesFromList(uint256[] calldata tradeIds) external view returns (uint8[] memory states) {
         uint256 len = tradeIds.length;
         if (len > 1000) revert("List too long");
@@ -356,14 +318,59 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
+    /**
+     * @notice ✅ NOUVEAU : Récupère les structures complètes (Trade) pour une liste d'IDs.
+     * Idéal pour initialiser un dashboard avec les trades d'un utilisateur récupérés en DB.
+     */
+    function getTradesFromList(uint256[] calldata tradeIds) external view returns (IBrokexCore.Trade[] memory fetchedTrades) {
+        uint256 len = tradeIds.length;
+        if (len > 1000) revert("List too long");
+
+        fetchedTrades = new IBrokexCore.Trade[](len);
+        for (uint256 i = 0; i < len; i++) {
+            fetchedTrades[i] = core.trades(tradeIds[i]);
+        }
+    }
+
+    /**
+     * @notice ✅ NOUVEAU : Récupère les Stop Loss et Take Profit d'une liste précise de trades.
+     */
+    function getSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
+        uint256 len = tradeIds.length;
+        if (len > 1000) revert("List too long");
+
+        stopLosses = new uint48[](len);
+        takeProfits = new uint48[](len);
+
+        for (uint256 i = 0; i < len; i++) {
+            IBrokexCore.Trade memory t = core.trades(tradeIds[i]);
+            stopLosses[i] = t.stopLoss;
+            takeProfits[i] = t.takeProfit;
+        }
+    }
+
+    /**
+     * @notice ✅ NOUVEAU : Récupère les Stop Loss et Take Profit d'une plage (range) continue de trades.
+     */
+    function getSLTPFromRange(uint256 startTradeId, uint256 count) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
+        if (count > 1000) revert("Range too large");
+
+        stopLosses = new uint48[](count);
+        takeProfits = new uint48[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            IBrokexCore.Trade memory t = core.trades(startTradeId + i);
+            stopLosses[i] = t.stopLoss;
+            takeProfits[i] = t.takeProfit;
+        }
+    }
+
     // =========================================================================
-    //              8. EX-CORE VIEWS (LENS PATTERN - Déplacées ici)
+    //              8. EX-CORE VIEWS (LENS PATTERN)
     // =========================================================================
 
     // Cette fonction lit les mappings bruts du Core pour calculer les stats
     function getExposureAndAveragePrices(uint32 assetId) external view returns (uint32 longLots, uint32 shortLots, uint256 avgLongPrice, uint256 avgShortPrice) {
-        // Lecture du mapping public 'exposures' dans le Core
-        // Solidity retourne un tuple pour les structs dans les interfaces
         (
             int32 _longLots, int32 _shortLots, 
             uint128 _longValueSum, uint128 _shortValueSum,
@@ -378,7 +385,6 @@ contract BrokexPaymaster is Pausable, Ownable {
     }
 
     function getAssetRiskLimits(uint32 assetId) external view returns (uint32 maxLong, uint32 maxShort, uint32 oracleDelay, bool isOpenAllowed) {
-        // Lecture du mapping public 'assets' dans le Core
         (
             , , , , , , , , , , 
             uint32 _maxLongLots, uint32 _maxShortLots, uint32 _maxOracleDelay, 
@@ -388,45 +394,28 @@ contract BrokexPaymaster is Pausable, Ownable {
         return (_maxLongLots, _maxShortLots, _maxOracleDelay, _allowOpen);
     }
 
-    function getAirdropStats(uint32 seasonId, address trader) external view returns (uint256 myVolume, uint256 myWinPnL, uint256 totalSeasonVolume, uint256 totalSeasonWinPnL) {
-        return (
-            core.seasonTraderVolume(seasonId, trader),
-            core.seasonTraderWinPnL(seasonId, trader),
-            core.seasonTotalVolume(seasonId),
-            core.seasonTotalWinPnL(seasonId)
-        );
-    }
-
-    function getSeasonGlobalStats(uint32 seasonId) external view returns (uint256 totalVolume, uint256 totalWinPnL) {
-        return (core.seasonTotalVolume(seasonId), core.seasonTotalWinPnL(seasonId));
-    }
-
     // =========================================================================
-    //              9. FUNDING RATE LENS (NEW)
+    //              9. FUNDING RATE LENS
     // =========================================================================
 
     /**
      * @notice Calcule l'index de funding théorique en temps réel (Lens via Paymaster).
      */
     function getLiveFundingIndices(uint32 assetId) external view returns (uint128 longIdx, uint128 shortIdx) {
-        // 1. Récupérer l'état du funding depuis le Core
         (uint64 lastUpdate, uint128 longFundingIndex, uint128 shortFundingIndex) = core.fundingStates(assetId);
         
-        // 2. Récupérer l'exposition et les paramètres de l'asset
         (int32 longLots, int32 shortLots, , , , , , ) = core.exposures(assetId);
         ( , , , uint32 baseFundingRate, , , , , , , , , , , ) = core.assets(assetId);
 
         longIdx = longFundingIndex;
         shortIdx = shortFundingIndex;
 
-        // 3. Calcul théorique si du temps a passé
         if (block.timestamp > lastUpdate && lastUpdate != 0) {
             uint256 timePassed = block.timestamp - lastUpdate;
 
             uint256 L = uint256(longLots > 0 ? uint256(int256(longLots)) : 0);
             uint256 S = uint256(shortLots > 0 ? uint256(int256(shortLots)) : 0);
             
-            // Appelle la formule copiée localement
             (uint256 longRateHourly, uint256 shortRateHourly) = _computeFundingRateQuadratic(L, S, uint256(baseFundingRate));
 
             longIdx += uint128((longRateHourly * timePassed) / 3600);
