@@ -207,7 +207,7 @@ library BrokexLibrary {
     }
 
     // ✅ NOUVELLE LOGIQUE V22.2: PnL avec Spread WAD
-    function calculateNetPnl(Trade memory t, Asset memory a, FundingState memory f, Exposure memory e, uint256 price1e6, int32 sizeToCalc, uint256 currentTimestamp) external pure returns (int256) {
+    function calculateNetPnl(Trade memory t, Asset memory a, FundingState memory f, Exposure memory e, uint256 price1e6, int32 sizeToCalc, uint256 currentTimestamp) external pure returns (int256, uint256) {
         uint256 spreadWad = calculateSpread(a, e, !t.isLong, false, uint32(sizeToCalc));
         uint256 spreadAmount = (price1e6 * spreadWad) / 1e18;
         
@@ -233,7 +233,9 @@ library BrokexLibrary {
         uint256 weekendPercentTotal = calculateWeekendFunding(t, a, currentTimestamp); 
         uint256 weekendFeesFinal = (exitNotional6 * weekendPercentTotal) / 1e18;
 
-        return rawPnl18 - int256((fundingPaidUsdc + weekendFeesFinal) * 1e12);
+        int256 finalPnl = rawPnl18 - int256((fundingPaidUsdc + weekendFeesFinal) * 1e12);
+        
+        return (finalPnl, exitPrice);
     }
 
     function calculateAssetPnlCapped(Exposure memory e, Asset memory a, uint256 currentPrice1e6) external pure returns (int256 pnlX6) {
@@ -776,31 +778,6 @@ contract BrokexCore {
         _finalizeClose(t, price1e6, tradeId, lotsToClose);
     }
 
-    function liquidatePosition(uint256 tradeId, bytes calldata oracleProof) external {
-        BrokexLibrary.Trade storage t = trades[tradeId];
-        if (t.state != 1) revert NotOpen();
-        
-        _updateFundingRate(t.assetId);
-
-        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
-        uint256 liqPrice = BrokexLibrary.calculateLiquidationPrice(t, assets[t.assetId], fundingStates[t.assetId], exposures[t.assetId], block.timestamp);
-        
-        bool isLiq = t.isLong ? price1e6 <= liqPrice : price1e6 >= liqPrice;
-        if (!isLiq) revert NotLiq();
-
-        int32 remainingLots = t.lotSize - t.closedLotSize;
-
-        _updateExposure(t.assetId, remainingLots, t.openPrice, t.isLong, false);
-        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, false);
-        
-        t.state = 2; 
-        t.closePrice = uint48(price1e6);
-        t.closedLotSize = t.lotSize;
-
-        brokexVault.liquidate(tradeId);
-        emit TradeEvent(tradeId, 4);
-    }
-
     function executeStopOrTakeProfit(uint256 tradeId, bytes calldata oracleProof) external {
         BrokexLibrary.Trade storage t = trades[tradeId];
         if (t.state != 1) revert NotOpen();
@@ -862,7 +839,8 @@ contract BrokexCore {
             lpToRelease = (uint256(t.lpLockedCapital) * currentRatioWad) / 1e18;
         }
 
-        int256 netPnl = BrokexLibrary.calculateNetPnl(t, assets[t.assetId], fundingStates[t.assetId], exposures[t.assetId], price1e6, lotsToClose, block.timestamp);
+        // ✅ NOUVEAU : Récupère le netPnl ET le exitPrice
+        (int256 netPnl, uint256 exitPrice) = BrokexLibrary.calculateNetPnl(t, assets[t.assetId], fundingStates[t.assetId], exposures[t.assetId], price1e6, lotsToClose, block.timestamp);
 
         _updateExposure(t.assetId, lotsToClose, t.openPrice, t.isLong, false);
         _updateExposureLimits(t.assetId, uint64(lpToRelease), uint64(marginToRelease), t.isLong, false);
@@ -870,7 +848,8 @@ contract BrokexCore {
         uint256 prevClosed = uint256(uint32(t.closedLotSize));
         uint256 currentClosed = uint256(uint32(lotsToClose));
         if (prevClosed + currentClosed > 0) {
-             uint256 weightedSum = (uint256(t.closePrice) * prevClosed) + (price1e6 * currentClosed);
+             // ✅ NOUVEAU : Utilise l'exitPrice (avec spread) pour la moyenne
+             uint256 weightedSum = (uint256(t.closePrice) * prevClosed) + (exitPrice * currentClosed);
              t.closePrice = uint48(weightedSum / (prevClosed + currentClosed));
         }
 
@@ -889,6 +868,38 @@ contract BrokexCore {
         
         emit TradeEvent(tradeId, 2);
     }
+
+    function liquidatePosition(uint256 tradeId, bytes calldata oracleProof) external {
+        BrokexLibrary.Trade storage t = trades[tradeId];
+        if (t.state != 1) revert NotOpen();
+        
+        _updateFundingRate(t.assetId);
+
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+        uint256 liqPrice = BrokexLibrary.calculateLiquidationPrice(t, assets[t.assetId], fundingStates[t.assetId], exposures[t.assetId], block.timestamp);
+        
+        bool isLiq = t.isLong ? price1e6 <= liqPrice : price1e6 >= liqPrice;
+        if (!isLiq) revert NotLiq();
+
+        int32 remainingLots = t.lotSize - t.closedLotSize;
+
+        _updateExposure(t.assetId, remainingLots, t.openPrice, t.isLong, false);
+        _updateExposureLimits(t.assetId, t.lpLockedCapital, t.marginUsdc, t.isLong, false);
+        
+        // ✅ NOUVEAU : Calcul du spread à la volée pour stocker le prix réel de liquidation
+        uint256 spreadWad = BrokexLibrary.calculateSpread(assets[t.assetId], exposures[t.assetId], !t.isLong, false, uint32(remainingLots));
+        uint256 spreadAmount = (price1e6 * spreadWad) / 1e18;
+        uint256 exitPrice = t.isLong ? (price1e6 > spreadAmount ? price1e6 - spreadAmount : 0) : (price1e6 + spreadAmount);
+
+        t.state = 2; 
+        t.closePrice = uint48(exitPrice); // Stocké avec le spread
+        t.closedLotSize = t.lotSize;
+
+        brokexVault.liquidate(tradeId);
+        emit TradeEvent(tradeId, 4);
+    }
+
+    
 
     // ----------------------------------------------------------------
     // 11. UNREALIZED PNL (BATCH)
@@ -981,7 +992,8 @@ contract BrokexCore {
 
         int32 remaining = t.lotSize - t.closedLotSize;
 
-        int256 netPnl = BrokexLibrary.calculateNetPnl(t, assets[t.assetId], fundingStates[t.assetId], exposures[t.assetId], price1e6, remaining, block.timestamp);
+        // ✅ NOUVEAU : On ignore la deuxième variable retournée ici (exitPrice) en laissant un espace vide
+        (int256 netPnl, ) = BrokexLibrary.calculateNetPnl(t, assets[t.assetId], fundingStates[t.assetId], exposures[t.assetId], price1e6, remaining, block.timestamp);
 
         uint256 maxPayout18 = uint256(t.lpLockedCapital) * 1e12;
 
