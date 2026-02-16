@@ -983,4 +983,54 @@ contract BrokexCore {
     function validateStops(uint256 entryPrice, bool isLong, uint256 stopLoss, uint256 takeProfit) external pure returns (bool, string memory) {
         return BrokexLibrary.validateStops(entryPrice, isLong, stopLoss, takeProfit);
     }
+
+    /**
+ * @notice Calcule le prix de liquidation avec funding "live" (virtuel).
+ * @dev Ne modifie pas l'état, juste calcule ce que serait le funding si update maintenant.
+ * @param tradeId ID du trade
+ * @return Prix de liquidation avec funding à jour virtuel
+ */
+function calculateLiquidationPriceLive(uint256 tradeId) external view returns (uint256) {
+    BrokexLibrary.Trade storage t = trades[tradeId];
+    
+    // Vérifications
+    if (t.state != 1) return 0;
+    int32 remainingLots = t.lotSize - t.closedLotSize;
+    if (remainingLots <= 0) return 0;
+    
+    // Récupérer les données
+    BrokexLibrary.Asset memory a = assets[t.assetId];
+    BrokexLibrary.FundingState memory f = fundingStates[t.assetId];
+    BrokexLibrary.Exposure memory e = exposures[t.assetId];
+    
+    // ✅ CALCUL VIRTUEL DU FUNDING (sans modifier storage)
+    uint128 liveLongIdx = f.longFundingIndex;
+    uint128 liveShortIdx = f.shortFundingIndex;
+    
+    if (block.timestamp > f.lastUpdate && f.lastUpdate != 0) {
+        uint256 timePassed = block.timestamp - f.lastUpdate;
+        
+        // Même calcul que _updateFundingRate mais sans écrire
+        uint256 L = uint256(int256(e.longLots) > 0 ? uint256(int256(e.longLots)) : 0);
+        uint256 S = uint256(int256(e.shortLots) > 0 ? uint256(int256(e.shortLots)) : 0);
+        uint256 baseFunding = uint256(a.baseFundingRate);
+        
+        (uint256 longRateHourly, uint256 shortRateHourly) = 
+            BrokexLibrary.computeFundingRateQuadratic(L, S, baseFunding);
+        
+        // Index "virtuels" (pas écrits en storage)
+        liveLongIdx += uint128((longRateHourly * timePassed) / 3600);
+        liveShortIdx += uint128((shortRateHourly * timePassed) / 3600);
+    }
+    
+    // Créer un FundingState "virtuel" pour le calcul
+    BrokexLibrary.FundingState memory fLive = BrokexLibrary.FundingState({
+        lastUpdate: uint64(block.timestamp), // "Comme si" on avait updaté
+        longFundingIndex: liveLongIdx,
+        shortFundingIndex: liveShortIdx
+    });
+    
+    // Appel à la library avec le funding virtuel
+    return BrokexLibrary.calculateLiquidationPrice(t, a, fLive, e, block.timestamp);
+}
 }
