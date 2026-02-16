@@ -58,9 +58,12 @@ interface IBrokexCore {
     
     // Pour lire l'état du funding
     function fundingStates(uint32 assetId) external view returns (uint64 lastUpdate, uint128 longFundingIndex, uint128 shortFundingIndex);
+
+    // ✅ AJOUT : Pour lire le prix de liquidation Live depuis le Paymaster
+    function calculateLiquidationPriceLive(uint256 tradeId) external view returns (uint256);
 }
 
-/* ────────────────────────── Brokex Paymaster V4.7 (Relay + Lens - Off-Chain DB Ready) ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V4.8 (Relay + Lens - Off-Chain DB Ready) ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
@@ -319,8 +322,7 @@ contract BrokexPaymaster is Pausable, Ownable {
     }
 
     /**
-     * @notice ✅ NOUVEAU : Récupère les structures complètes (Trade) pour une liste d'IDs.
-     * Idéal pour initialiser un dashboard avec les trades d'un utilisateur récupérés en DB.
+     * @notice Récupère les structures complètes (Trade) pour une liste d'IDs.
      */
     function getTradesFromList(uint256[] calldata tradeIds) external view returns (IBrokexCore.Trade[] memory fetchedTrades) {
         uint256 len = tradeIds.length;
@@ -333,7 +335,7 @@ contract BrokexPaymaster is Pausable, Ownable {
     }
 
     /**
-     * @notice ✅ NOUVEAU : Récupère les Stop Loss et Take Profit d'une liste précise de trades.
+     * @notice Récupère les Stop Loss et Take Profit d'une liste précise de trades.
      */
     function getSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
         uint256 len = tradeIds.length;
@@ -350,7 +352,7 @@ contract BrokexPaymaster is Pausable, Ownable {
     }
 
     /**
-     * @notice ✅ NOUVEAU : Récupère les Stop Loss et Take Profit d'une plage (range) continue de trades.
+     * @notice Récupère les Stop Loss et Take Profit d'une plage (range) continue de trades.
      */
     function getSLTPFromRange(uint256 startTradeId, uint256 count) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
         if (count > 1000) revert("Range too large");
@@ -362,6 +364,31 @@ contract BrokexPaymaster is Pausable, Ownable {
             IBrokexCore.Trade memory t = core.trades(startTradeId + i);
             stopLosses[i] = t.stopLoss;
             takeProfits[i] = t.takeProfit;
+        }
+    }
+
+    /**
+     * @notice ✅ NOUVEAU : Récupère les Prix de Liquidation Live d'une liste précise de trades.
+     */
+    function getLiquidationPricesFromList(uint256[] calldata tradeIds) external view returns (uint256[] memory liqPrices) {
+        uint256 len = tradeIds.length;
+        if (len > 1000) revert("List too long");
+
+        liqPrices = new uint256[](len);
+        for (uint256 i = 0; i < len; i++) {
+            liqPrices[i] = core.calculateLiquidationPriceLive(tradeIds[i]);
+        }
+    }
+
+    /**
+     * @notice ✅ NOUVEAU : Récupère les Prix de Liquidation Live d'une plage (range) continue de trades.
+     */
+    function getLiquidationPricesFromRange(uint256 startTradeId, uint256 count) external view returns (uint256[] memory liqPrices) {
+        if (count > 1000) revert("Range too large");
+
+        liqPrices = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            liqPrices[i] = core.calculateLiquidationPriceLive(startTradeId + i);
         }
     }
 
