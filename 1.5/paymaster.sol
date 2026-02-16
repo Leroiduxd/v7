@@ -28,7 +28,7 @@ interface IBrokexCore {
         uint64 marginUsdc;
     }
 
-    // ✅ CRUCIAL : Permet au Paymaster de savoir quel sera le prochain ID
+    // Permet au Paymaster de savoir quel sera le prochain ID
     function nextTradeID() external view returns (uint256);
 
     // Getter automatique du mapping trades
@@ -49,9 +49,10 @@ interface IBrokexCore {
         uint128 longMaxProfit, uint128 shortMaxProfit, uint128 longMaxLoss, uint128 shortMaxLoss
     );
 
+    // ✅ CORRECTION CRITIQUE : Alignement strict sur la structure Asset du Core (uint64)
     function assets(uint32 assetId) external view returns (
-        uint32 assetId_, uint32 numerator, uint32 denominator, uint32 baseFundingRate,
-        uint32 spread, uint32 commission, uint32 weekendFunding, uint16 securityMultiplier,
+        uint32 assetId_, uint32 numerator, uint32 denominator, uint64 baseFundingRate,
+        uint64 spread, uint32 commission, uint64 weekendFunding, uint16 securityMultiplier,
         uint16 maxPhysicalMove, uint8 maxLeverage, uint32 maxLongLots, uint32 maxShortLots,
         uint32 maxOracleDelay, bool allowOpen, bool listed
     );
@@ -59,11 +60,11 @@ interface IBrokexCore {
     // Pour lire l'état du funding
     function fundingStates(uint32 assetId) external view returns (uint64 lastUpdate, uint128 longFundingIndex, uint128 shortFundingIndex);
 
-    // ✅ AJOUT : Pour lire le prix de liquidation Live depuis le Paymaster
+    // Pour lire le prix de liquidation Live depuis le Paymaster
     function calculateLiquidationPriceLive(uint256 tradeId) external view returns (uint256);
 }
 
-/* ────────────────────────── Brokex Paymaster V4.8 (Relay + Lens - Off-Chain DB Ready) ────────────────────────── */
+/* ────────────────────────── Brokex Paymaster V4.9.1 (Relay + Lens - Off-Chain DB Ready) ────────────────────────── */
 
 contract BrokexPaymaster is Pausable, Ownable {
     using ECDSA for bytes32;
@@ -307,9 +308,6 @@ contract BrokexPaymaster is Pausable, Ownable {
     //              7. VIEWS UTILITAIRES (Pour le Fetching de masse)
     // =========================================================================
 
-    /**
-     * @notice Récupère uniquement les états (state) d'une liste de trades.
-     */
     function getTradeStatesFromList(uint256[] calldata tradeIds) external view returns (uint8[] memory states) {
         uint256 len = tradeIds.length;
         if (len > 1000) revert("List too long");
@@ -321,9 +319,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
-    /**
-     * @notice Récupère les structures complètes (Trade) pour une liste d'IDs.
-     */
     function getTradesFromList(uint256[] calldata tradeIds) external view returns (IBrokexCore.Trade[] memory fetchedTrades) {
         uint256 len = tradeIds.length;
         if (len > 1000) revert("List too long");
@@ -334,9 +329,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
-    /**
-     * @notice Récupère les Stop Loss et Take Profit d'une liste précise de trades.
-     */
     function getSLTPFromList(uint256[] calldata tradeIds) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
         uint256 len = tradeIds.length;
         if (len > 1000) revert("List too long");
@@ -351,9 +343,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
-    /**
-     * @notice Récupère les Stop Loss et Take Profit d'une plage (range) continue de trades.
-     */
     function getSLTPFromRange(uint256 startTradeId, uint256 count) external view returns (uint48[] memory stopLosses, uint48[] memory takeProfits) {
         if (count > 1000) revert("Range too large");
 
@@ -367,9 +356,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
-    /**
-     * @notice ✅ NOUVEAU : Récupère les Prix de Liquidation Live d'une liste précise de trades.
-     */
     function getLiquidationPricesFromList(uint256[] calldata tradeIds) external view returns (uint256[] memory liqPrices) {
         uint256 len = tradeIds.length;
         if (len > 1000) revert("List too long");
@@ -380,9 +366,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
-    /**
-     * @notice ✅ NOUVEAU : Récupère les Prix de Liquidation Live d'une plage (range) continue de trades.
-     */
     function getLiquidationPricesFromRange(uint256 startTradeId, uint256 count) external view returns (uint256[] memory liqPrices) {
         if (count > 1000) revert("Range too large");
 
@@ -396,7 +379,6 @@ contract BrokexPaymaster is Pausable, Ownable {
     //              8. EX-CORE VIEWS (LENS PATTERN)
     // =========================================================================
 
-    // Cette fonction lit les mappings bruts du Core pour calculer les stats
     function getExposureAndAveragePrices(uint32 assetId) external view returns (uint32 longLots, uint32 shortLots, uint256 avgLongPrice, uint256 avgShortPrice) {
         (
             int32 _longLots, int32 _shortLots, 
@@ -432,7 +414,9 @@ contract BrokexPaymaster is Pausable, Ownable {
         (uint64 lastUpdate, uint128 longFundingIndex, uint128 shortFundingIndex) = core.fundingStates(assetId);
         
         (int32 longLots, int32 shortLots, , , , , , ) = core.exposures(assetId);
-        ( , , , uint32 baseFundingRate, , , , , , , , , , , ) = core.assets(assetId);
+        
+        // ✅ CORRECTION CRITIQUE : baseFundingRate est maintenant récupéré en uint64
+        ( , , , uint64 baseFundingRate, , , , , , , , , , , ) = core.assets(assetId);
 
         longIdx = longFundingIndex;
         shortIdx = shortFundingIndex;
@@ -450,9 +434,6 @@ contract BrokexPaymaster is Pausable, Ownable {
         }
     }
 
-    /**
-     * @notice Copie pure de la formule du Core pour simuler le taux (Zéro Gas).
-     */
     function _computeFundingRateQuadratic(uint256 L, uint256 S, uint256 baseFunding) internal pure returns (uint256 longRate, uint256 shortRate) {
         if (L == S) return (baseFunding, baseFunding);
         uint256 numerator = (L > S) ? (L - S) : (S - L);
