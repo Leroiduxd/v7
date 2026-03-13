@@ -731,6 +731,8 @@ contract BrokexVault {
             lpFreeCapital -= profit;
             freeBalance[trader] += profit;
 
+            currentEpochRealizedPnl -= int256(profit);
+
         } else if (pnl6 < 0) {
             uint256 loss = uint256(-pnl6);
 
@@ -743,6 +745,8 @@ contract BrokexVault {
 
             ownerFeeReserve += provision;
             lpFreeCapital += lpShare;
+
+            currentEpochRealizedPnl += int256(loss);
         }
     }
     
