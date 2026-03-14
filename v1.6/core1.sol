@@ -160,6 +160,15 @@ library BrokexLibrary {
         return (maxProfitLev < physProfit) ? maxProfitLev : physProfit;
     }
 
+    function calculateCommission6(
+        Asset memory a,
+        uint256 entryPrice,
+        uint32 lotSize
+    ) external pure returns (uint256) {
+        uint256 notional6 = getNotionalValue(a, entryPrice, lotSize);
+        return (notional6 * uint256(a.commission)) / 10000;
+    }
+
     // ✅ NOUVELLE LOGIQUE V22.2: Liquidation avec Spread WAD
     function calculateLiquidationPrice(
         Trade memory t,
@@ -736,7 +745,12 @@ contract BrokexCore {
             leverage
         );
 
-        uint256 commission6 = (margin6 * assets[assetId].commission) / 10000;
+        // ✅ Commission sur le notionnel
+        uint256 commission6 = BrokexLibrary.calculateCommission6(
+            assets[assetId],
+            entryPrice,
+            uint32(lotSize)
+        );
 
         uint256 tradeId = ++nextTradeID;
         BrokexLibrary.Trade storage t = trades[tradeId];
@@ -749,6 +763,7 @@ contract BrokexCore {
         t.openPrice = uint48(entryPrice);
         t.state = 1;
         t.openTimestamp = uint32(block.timestamp);
+        t.closeTimestamp = 0;
 
         BrokexLibrary.FundingState memory fs = fundingStates[assetId];
         t.fundingIndex = isLong ? fs.longFundingIndex : fs.shortFundingIndex;
@@ -810,7 +825,12 @@ contract BrokexCore {
             leverage
         );
 
-        uint256 commission6 = (margin6 * assets[assetId].commission) / 10000;
+        // ✅ Commission réservée sur le notionnel du targetPrice
+        uint256 commission6 = BrokexLibrary.calculateCommission6(
+            assets[assetId],
+            uint256(targetPrice),
+            uint32(lotSize)
+        );
 
         uint256 tradeId = ++nextTradeID;
 
@@ -1192,34 +1212,34 @@ contract BrokexCore {
     }
 
     function liquidateProfit(uint256 tradeId, bytes calldata oracleProof) external {
-    BrokexLibrary.Trade storage t = trades[tradeId];
+        BrokexLibrary.Trade storage t = trades[tradeId];
 
-    if (t.state != 1) revert NotOpen();
+        if (t.state != 1) revert NotOpen();
 
-    _updateFundingRate(t.assetId);
+        _updateFundingRate(t.assetId);
 
-    uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
 
-    int32 remaining = t.lotSize - t.closedLotSize;
+        int32 remaining = t.lotSize - t.closedLotSize;
 
-    (int256 netPnl, , ) = BrokexLibrary.calculateNetPnl(
-        t,
-        assets[t.assetId],
-        fundingStates[t.assetId],
-        exposures[t.assetId],
-        price1e6,
-        remaining,
-        block.timestamp
-    );
+        (int256 netPnl, , ) = BrokexLibrary.calculateNetPnl(
+            t,
+            assets[t.assetId],
+            fundingStates[t.assetId],
+            exposures[t.assetId],
+            price1e6,
+            remaining,
+            block.timestamp
+        );
 
-    uint256 maxPayout18 = uint256(t.lpLockedCapital) * 1e12;
+        uint256 maxPayout18 = uint256(t.lpLockedCapital) * 1e12;
 
-    if (netPnl <= 0 || uint256(netPnl) <= maxPayout18) {
-        revert PnlUnderCap();
+        if (netPnl <= 0 || uint256(netPnl) <= maxPayout18) {
+            revert PnlUnderCap();
+        }
+
+        _finalizeClose(t, price1e6, tradeId, remaining);
     }
-
-    _finalizeClose(t, price1e6, tradeId, remaining);
-}
 
     // ----------------------------------------------------------------
     // 13. FRONTEND HELPERS (WRAPPERS)
