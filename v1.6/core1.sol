@@ -11,22 +11,23 @@ library BrokexLibrary {
     // ==========================================
 
     struct Trade {
-        address trader;      
-        uint32 assetId;      
-        bool isLong;         
-        bool isLimit;        
-        uint8 leverage;      
-        uint48 openPrice;    
-        uint8 state;         
+        address trader;
+        uint32 assetId;
+        bool isLong;
+        bool isLimit;
+        uint8 leverage;
+        uint48 openPrice;
+        uint8 state;
         uint32 openTimestamp;
+        uint32 closeTimestamp;
         uint128 fundingIndex;
-        uint48 closePrice;   
-        int32 lotSize;       
-        int32 closedLotSize; 
-        uint48 stopLoss;     
-        uint48 takeProfit;   
-        uint64 lpLockedCapital; 
-        uint64 marginUsdc;     
+        uint48 closePrice;
+        int32 lotSize;
+        int32 closedLotSize;
+        uint48 stopLoss;
+        uint48 takeProfit;
+        uint64 lpLockedCapital;
+        uint64 marginUsdc;
         uint64 totalFeesPaidUsdc;
     }
 
@@ -822,6 +823,7 @@ contract BrokexCore {
             openPrice: targetPrice,
             state: 0,
             openTimestamp: uint32(block.timestamp),
+            closeTimestamp: 0,
             fundingIndex: 0,
             closePrice: 0,
             lotSize: lotSize,
@@ -1033,6 +1035,7 @@ contract BrokexCore {
         bool isFullClose = (t.closedLotSize >= t.lotSize);
         if (isFullClose) {
             t.state = 2;
+            t.closeTimestamp = uint32(block.timestamp);
         }
 
         brokexVault.unlockTraderFunds(t.trader, marginToRelease);
@@ -1083,6 +1086,7 @@ contract BrokexCore {
 
         t.state = 2;
         t.closePrice = uint48(exitPrice);
+        t.closeTimestamp = uint32(block.timestamp);
         t.closedLotSize = t.lotSize;
 
         if (extraFeesUsdc > 0) {
