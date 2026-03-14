@@ -89,10 +89,6 @@ library BrokexLibrary {
         return (price * uint256(lotSize) * uint256(a.numerator)) / uint256(a.denominator);
     }
 
-    function isRoundLeverage(uint8 lev) internal pure returns (bool) {
-        return (lev == 1 || lev == 2 || lev == 3 || lev == 5 || lev == 10 || lev == 20 || lev == 25 || lev == 50 || lev == 100);
-    }
-
     function validateStops(uint256 entryPrice, bool isLong, uint256 stopLoss, uint256 takeProfit) external pure returns (bool, string memory) {
         if (stopLoss == 0 && takeProfit == 0) return (true, "");
         if (stopLoss != 0 && takeProfit != 0 && stopLoss == takeProfit) return (false, "SlEqualsTp");
@@ -1180,60 +1176,80 @@ contract BrokexCore {
     }
 
     function liquidateProfit(uint256 tradeId, bytes calldata oracleProof) external {
-        BrokexLibrary.Trade storage t = trades[tradeId];
-    
-        if (t.state != 1) revert NotOpen();
-    
-        _updateFundingRate(t.assetId);
-    
-        uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
-    
-        int32 remaining = t.lotSize - t.closedLotSize;
-    
-        (int256 netPnl, , ) = BrokexLibrary.calculateNetPnl(
-            t,
-            assets[t.assetId],
-            fundingStates[t.assetId],
-            exposures[t.assetId],
-            price1e6,
-            remaining,
-            block.timestamp
-        );
-    
-        uint256 maxPayout18 = uint256(t.lpLockedCapital) * 1e12;
-    
-        if (netPnl <= 0 || uint256(netPnl) <= maxPayout18) {
-            revert PnlUnderCap();
-        }
-    
-        _finalizeClose(t, price1e6, tradeId, remaining);
+    BrokexLibrary.Trade storage t = trades[tradeId];
+
+    if (t.state != 1) revert NotOpen();
+
+    _updateFundingRate(t.assetId);
+
+    uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+
+    int32 remaining = t.lotSize - t.closedLotSize;
+
+    (int256 netPnl, , ) = BrokexLibrary.calculateNetPnl(
+        t,
+        assets[t.assetId],
+        fundingStates[t.assetId],
+        exposures[t.assetId],
+        price1e6,
+        remaining,
+        block.timestamp
+    );
+
+    uint256 maxPayout18 = uint256(t.lpLockedCapital) * 1e12;
+
+    if (netPnl <= 0 || uint256(netPnl) <= maxPayout18) {
+        revert PnlUnderCap();
     }
+
+    _finalizeClose(t, price1e6, tradeId, remaining);
+}
 
     // ----------------------------------------------------------------
     // 13. FRONTEND HELPERS (WRAPPERS)
     // ----------------------------------------------------------------
-
-    function calculateSpread(uint32 assetId, bool isLong, bool isOpening, uint32 lotSize) external view returns (uint256) {
-        return BrokexLibrary.calculateSpread(assets[assetId], exposures[assetId], isLong, isOpening, lotSize);
-    }
-
-    function calculateWeekendFunding(uint256 tradeId) external view returns (uint256) {
+    function calculateLiquidationPriceLive(uint256 tradeId) external view returns (uint256) {
         BrokexLibrary.Trade storage t = trades[tradeId];
-        return BrokexLibrary.calculateWeekendFunding(t, assets[t.assetId], block.timestamp);
+
+        if (t.state != 1) return 0;
+
+        int32 remainingLots = t.lotSize - t.closedLotSize;
+        if (remainingLots <= 0) return 0;
+
+        BrokexLibrary.Asset memory a = assets[t.assetId];
+        BrokexLibrary.FundingState memory f = fundingStates[t.assetId];
+        BrokexLibrary.Exposure memory e = exposures[t.assetId];
+
+        uint128 liveLongIdx = f.longFundingIndex;
+        uint128 liveShortIdx = f.shortFundingIndex;
+
+        if (block.timestamp > f.lastUpdate && f.lastUpdate != 0) {
+            uint256 timePassed = block.timestamp - f.lastUpdate;
+
+            uint256 L = e.longLots > 0 ? uint256(uint32(e.longLots)) : 0;
+            uint256 S = e.shortLots > 0 ? uint256(uint32(e.shortLots)) : 0;
+            uint256 baseFunding = uint256(a.baseFundingRate);
+
+            (uint256 longRateHourly, uint256 shortRateHourly) =
+                BrokexLibrary.computeFundingRateQuadratic(L, S, baseFunding);
+
+            liveLongIdx += uint128((longRateHourly * timePassed) / 3600);
+            liveShortIdx += uint128((shortRateHourly * timePassed) / 3600);
+        }
+
+        BrokexLibrary.FundingState memory fLive = BrokexLibrary.FundingState({
+            lastUpdate: uint64(block.timestamp),
+            longFundingIndex: liveLongIdx,
+            shortFundingIndex: liveShortIdx
+        });
+
+        return BrokexLibrary.calculateLiquidationPrice(
+            t,
+            a,
+            fLive,
+            e,
+            block.timestamp
+        );
     }
-
-    function calculateMargin6(uint32 assetId, uint256 entryPrice, uint32 lotSize, uint8 leverage) external view returns (uint256) {
-        return BrokexLibrary.calculateMargin6(assets[assetId], entryPrice, lotSize, leverage);
-    }
-
-    function calculateLockedCapital(uint32 assetId, uint256 entryPrice, uint32 lotSize, uint8 leverage) external view returns (uint256) {
-        return BrokexLibrary.calculateLockedCapital(assets[assetId], entryPrice, lotSize, leverage);
-    }
-
-    function validateStops(uint256 entryPrice, bool isLong, uint256 stopLoss, uint256 takeProfit) external pure returns (bool, string memory) {
-        return BrokexLibrary.validateStops(entryPrice, isLong, stopLoss, takeProfit);
-    }
-
-
 
 }
