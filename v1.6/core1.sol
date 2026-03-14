@@ -367,6 +367,7 @@ contract BrokexCore {
     error ShortTpTooHigh();
     error ShortSlTooLow();
     error PnlUnderCap();
+    error NotAuthorized();
 
     // ----------------------------------------------------------------
     // CONSTANTES & STATE
@@ -380,7 +381,7 @@ contract BrokexCore {
     address public immutable owner;
     
     address public paymaster;
-    
+    address public riskManager;
     address public libraryAddress;
 
     uint256 public nextTradeID;
@@ -404,6 +405,12 @@ contract BrokexCore {
 
     modifier onlyOwner() { if (msg.sender != owner) revert NotOwner(); _; }
     modifier onlyPaymaster() { if (msg.sender != paymaster) revert NotPaymaster(); _; }
+    modifier onlyRiskManagerOrOwner() {
+        if (msg.sender != owner) {
+            if (riskManager == address(0) || msg.sender != riskManager) revert NotAuthorized();
+        }
+        _;
+    }
 
     constructor(address _oracle, address _libraryAddress) {
         owner = msg.sender;
@@ -411,6 +418,7 @@ contract BrokexCore {
         
         require(_libraryAddress != address(0), "Zero Address for Lib");
         libraryAddress = _libraryAddress;
+        riskManager = address(0); 
     }
 
     function setBrokexVault(address vault) external onlyOwner {
@@ -422,6 +430,10 @@ contract BrokexCore {
         require(paymaster == address(0), "PAYMASTER_ALREADY_SET");
         if (_paymaster == address(0)) revert ZeroAddr();
         paymaster = _paymaster;
+    }
+
+    function setRiskManager(address _riskManager) external onlyOwner {
+        riskManager = _riskManager;
     }
 
     // ----------------------------------------------------------------
@@ -510,7 +522,7 @@ contract BrokexCore {
         assets[assetId].maxOracleDelay = newDelay;
     }
 
-    function setAssetRiskLimits(uint32 assetId, uint32 _maxLongLots, uint32 _maxShortLots) external onlyOwner {
+    function setAssetRiskLimits(uint32 assetId, uint32 _maxLongLots, uint32 _maxShortLots) external onlyRiskManagerOrOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
         assets[assetId].maxLongLots = _maxLongLots;
         assets[assetId].maxShortLots = _maxShortLots;
