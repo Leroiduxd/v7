@@ -1048,7 +1048,6 @@ contract BrokexCore {
 
         int32 remainingLots = t.lotSize - t.closedLotSize;
         uint256 remainingMargin6 = uint256(t.marginUsdc);
-        uint256 remainingLpCap6 = uint256(t.lpLockedCapital);
 
         // 1. Mise à jour de l'exposition agrégée
         _updateExposure(t.assetId, remainingLots, t.openPrice, t.isLong, false);
