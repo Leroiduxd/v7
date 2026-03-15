@@ -510,23 +510,26 @@ contract BrokexVault {
         - ici on ne change PAS totalLpShares
         - ici on crédite seulement le lpBalance utilisateur
     */
-    function processDeposit(uint256 depositId) external {
-        DepositRequest storage request = depositRequests[depositId];
-
-        require(request.user != address(0), "deposit not found");
-        require(!request.processed, "already processed");
-        require(currentEpoch > request.epoch, "epoch not closed");
-
-        uint256 price = epochs[request.epoch].price;
-        require(price > 0, "price not set");
-
-        uint256 shares = _sharesFromAmount(request.amount, price);
-        require(shares > 0, "shares zero");
-
-        request.processed = true;
-        lpBalance[request.user] += shares;
-
-        emit DepositProcessed(depositId, request.user, request.amount, shares);
+    function processDeposit(uint256[] calldata depositIds) external {
+        for (uint256 i = 0; i < depositIds.length; i++) {
+            uint256 depositId = depositIds[i];
+            DepositRequest storage request = depositRequests[depositId];
+    
+            require(request.user != address(0), "deposit not found");
+            require(!request.processed, "already processed");
+            require(currentEpoch > request.epoch, "epoch not closed");
+    
+            uint256 price = epochs[request.epoch].price;
+            require(price > 0, "price not set");
+    
+            uint256 shares = _sharesFromAmount(request.amount, price);
+            require(shares > 0, "shares zero");
+    
+            request.processed = true;
+            lpBalance[request.user] += shares;
+    
+            emit DepositProcessed(depositId, request.user, request.amount, shares);
+        }
     }
 
     // ======================================
@@ -692,7 +695,7 @@ contract BrokexVault {
                 if (totalLpShares == 0) {
                     price = oneDollar;
                 } else {
-                    int256 equity = int256(capital) - unrealizedPnl;
+                    int256 equity = int256(capital) + unrealizedPnl;
                     require(equity > 0, "equity not positive");
 
                     price = (uint256(equity) * oneDollar) / totalLpShares;
@@ -906,30 +909,33 @@ contract BrokexVault {
         dans allocatedAmount de cette epoch
         moins ce qu'il a déjà claim.
     */
-    function claimWithdraw(uint256 withdrawEpoch) external {
-        uint256 withdrawId = userWithdrawId[msg.sender][withdrawEpoch];
-        require(withdrawId != 0, "withdraw not found");
-
-        WithdrawRequest storage request = withdrawRequests[withdrawId];
-        WithdrawEpochData storage bucket = withdrawEpochs[withdrawEpoch];
-
-        require(request.user == msg.sender, "not your withdraw");
-        require(bucket.totalShares > 0, "empty epoch");
-
-        /*
-            Quote-part de l'utilisateur sur tout ce qui a déjà été alloué
-            à cette epoch.
-        */
-        uint256 totalDue = (bucket.allocatedAmount * request.shares) / bucket.totalShares;
-        require(totalDue > request.claimedAmount, "nothing to claim");
-
-        uint256 amount = totalDue - request.claimedAmount;
-        request.claimedAmount = totalDue;
-
-        bool success = usdc.transfer(msg.sender, amount);
+    function claimWithdraw(uint256[] calldata withdrawEpochs_) external {
+        uint256 totalAmount = 0;
+    
+        for (uint256 i = 0; i < withdrawEpochs_.length; i++) {
+            uint256 withdrawEpoch = withdrawEpochs_[i];
+            uint256 withdrawId = userWithdrawId[msg.sender][withdrawEpoch];
+            require(withdrawId != 0, "withdraw not found");
+    
+            WithdrawRequest storage request = withdrawRequests[withdrawId];
+            WithdrawEpochData storage bucket = withdrawEpochs[withdrawEpoch];
+    
+            require(request.user == msg.sender, "not your withdraw");
+            require(bucket.totalShares > 0, "empty epoch");
+    
+            uint256 totalDue = (bucket.allocatedAmount * request.shares) / bucket.totalShares;
+            require(totalDue > request.claimedAmount, "nothing to claim");
+    
+            uint256 amount = totalDue - request.claimedAmount;
+            request.claimedAmount = totalDue;
+    
+            totalAmount += amount;
+    
+            emit WithdrawClaimed(msg.sender, withdrawEpoch, withdrawId, amount);
+        }
+    
+        bool success = usdc.transfer(msg.sender, totalAmount);
         require(success, "transfer failed");
-
-        emit WithdrawClaimed(msg.sender, withdrawEpoch, withdrawId, amount);
     }
 
     // ======================================
