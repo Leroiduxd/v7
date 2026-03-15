@@ -108,8 +108,6 @@ contract BrokexVault {
     uint256 public ownerFeeReserve;
     int256 public currentEpochRealizedPnl;
 
-    uint256 public minLpFreeReserve6;
-
     // --------------------------------------
     // Trader balances
     // --------------------------------------
@@ -763,7 +761,6 @@ contract BrokexVault {
         // ----------------------------------
         // 7) Update reserve variable for future lockLpCapital calls
         // ----------------------------------
-        minLpFreeReserve6 = (totalPendingWithdrawShares * price) / oneDollar;
 
         // ----------------------------------
         // 8) Save epoch snapshot
@@ -1038,7 +1035,9 @@ contract BrokexVault {
 
     function lockLpCapital(uint256 amount6) external onlyCore {
         require(amount6 > 0, "amount=0");
-        require(lpFreeCapital >= (minLpFreeReserve6 + amount6), "lpFree reserved");
+
+        uint256 estimatedReserve = getEstimatedWithdrawReserve();
+        require(lpFreeCapital >= (estimatedReserve + amount6), "lpFree reserved");
 
         lpFreeCapital -= amount6;
         lpLockedCapital += amount6;
