@@ -695,7 +695,7 @@ contract BrokexVault {
                     int256 equity = int256(capital) - unrealizedPnl;
                     require(equity > 0, "equity not positive");
 
-                    price = uint256(equity) / totalLpShares;
+                    price = (uint256(equity) * oneDollar) / totalLpShares;
                     require(price > 0, "price zero");
                 }
             }
