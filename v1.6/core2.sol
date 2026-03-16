@@ -1276,9 +1276,18 @@ contract BrokexCore {
                 actualPnl18 = int256(maxProfit18);
             }
         } else if (netPnl18 < 0) {
-            uint256 maxLoss18 = marginToRelease * 1e12;
-            if (uint256(-netPnl18) > maxLoss18) {
-                actualPnl18 = -int256(maxLoss18);
+            uint256 liqThreshold18 = (marginToRelease * 90 / 100) * 1e12;
+            uint256 fullMargin18 = marginToRelease * 1e12;
+
+            // Si la perte atteint au moins 90% de la marge,
+            // on consomme 100% de la marge de la portion fermée
+            if (uint256(-netPnl18) >= liqThreshold18) {
+                actualPnl18 = -int256(fullMargin18);
+            } else {
+                uint256 maxLoss18 = fullMargin18;
+                if (uint256(-netPnl18) > maxLoss18) {
+                    actualPnl18 = -int256(maxLoss18);
+                }
             }
         }
 
