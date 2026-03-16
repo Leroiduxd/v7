@@ -47,7 +47,7 @@ interface IBrokexCore {
     // --- Getters Automatiques des Mappings Publics du Core ---
     
     // ✅ CORRIGÉ : 10 valeurs de retour (ajout de overlapRisk et currentLpLock)
-    function exposures(uint32 assetId) external view returns (
+   function exposures(uint32 assetId) external view returns (
         int32 longLots, 
         int32 shortLots, 
         uint128 longValueSum, 
@@ -56,8 +56,10 @@ interface IBrokexCore {
         uint128 shortMaxProfit, 
         uint128 longMaxLoss, 
         uint128 shortMaxLoss,
-        uint128 overlapRisk,       // ✅ AJOUTÉ
-        uint128 currentLpLock      // ✅ AJOUTÉ
+        uint128 overlapRisk,
+        uint128 currentLpLock,
+        uint128 activeMalus,
+        uint32 malusBaseLots
     );
 
     // Alignement strict sur la structure Asset du Core (uint64)
@@ -390,21 +392,36 @@ contract BrokexPaymaster is Pausable, Ownable {
     //              8. EX-CORE VIEWS (LENS PATTERN)
     // =========================================================================
 
-    function getExposureAndAveragePrices(uint32 assetId) external view returns (uint32 longLots, uint32 shortLots, uint256 avgLongPrice, uint256 avgShortPrice) {
-        // ✅ CORRIGÉ : Ajustement des virgules pour ignorer les 6 dernières valeurs sur 10
+    function getExposureAndAveragePrices(uint32 assetId) external view returns (
+        uint32 longLots,
+        uint32 shortLots,
+        uint256 avgLongPrice,
+        uint256 avgShortPrice
+    ) {
         (
-            int32 _longLots, 
-            int32 _shortLots, 
-            uint128 _longValueSum, 
+            int32 _longLots,
+            int32 _shortLots,
+            uint128 _longValueSum,
             uint128 _shortValueSum,
-            , , , , , 
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            
         ) = core.exposures(assetId);
-
+    
         longLots = uint32(_longLots);
         shortLots = uint32(_shortLots);
-        
-        if (_longLots > 0) avgLongPrice = uint256(_longValueSum) / uint256(uint32(_longLots));
-        if (_shortLots > 0) avgShortPrice = uint256(_shortValueSum) / uint256(uint32(_shortLots));
+    
+        if (_longLots > 0) {
+            avgLongPrice = uint256(_longValueSum) / uint256(uint32(_longLots));
+        }
+        if (_shortLots > 0) {
+            avgShortPrice = uint256(_shortValueSum) / uint256(uint32(_shortLots));
+        }
     }
 
     function getAssetRiskLimits(uint32 assetId) external view returns (uint32 maxLong, uint32 maxShort, uint32 oracleDelay, bool isOpenAllowed) {
@@ -426,23 +443,52 @@ contract BrokexPaymaster is Pausable, Ownable {
      */
     function getLiveFundingIndices(uint32 assetId) external view returns (uint128 longIdx, uint128 shortIdx) {
         (uint64 lastUpdate, uint128 longFundingIndex, uint128 shortFundingIndex) = core.fundingStates(assetId);
-        
-        // ✅ CORRIGÉ : Ajustement des virgules pour ignorer les 8 dernières valeurs sur 10
-        (int32 longLots, int32 shortLots, , , , , , , , ) = core.exposures(assetId);
-        
-        ( , , , uint64 baseFundingRate, , , , , , , , , , , ) = core.assets(assetId);
-
+    
+        (
+            int32 longLots,
+            int32 shortLots,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            
+        ) = core.exposures(assetId);
+    
+        (
+            ,
+            ,
+            ,
+            uint64 baseFundingRate,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            ,
+            
+        ) = core.assets(assetId);
+    
         longIdx = longFundingIndex;
         shortIdx = shortFundingIndex;
-
+    
         if (block.timestamp > lastUpdate && lastUpdate != 0) {
             uint256 timePassed = block.timestamp - lastUpdate;
-
+    
             uint256 L = uint256(longLots > 0 ? uint256(int256(longLots)) : 0);
             uint256 S = uint256(shortLots > 0 ? uint256(int256(shortLots)) : 0);
-            
-            (uint256 longRateHourly, uint256 shortRateHourly) = _computeFundingRateQuadratic(L, S, uint256(baseFundingRate));
-
+    
+            (uint256 longRateHourly, uint256 shortRateHourly) =
+                _computeFundingRateQuadratic(L, S, uint256(baseFundingRate));
+    
             longIdx += uint128((longRateHourly * timePassed) / 3600);
             shortIdx += uint128((shortRateHourly * timePassed) / 3600);
         }
