@@ -190,24 +190,21 @@ library BrokexLibrary {
         uint256 longSide = uint256(e.longMaxProfit);
         uint256 shortSide = uint256(e.shortMaxProfit);
 
-        uint256 total = longSide + shortSide;
-        if (total == 0) return BPS;
+        uint256 matched = longSide < shortSide ? longSide : shortSide;
+        uint256 dominant = longSide > shortSide ? longSide : shortSide;
 
-        uint256 minSide = longSide < shortSide ? longSide : shortSide;
-        uint256 balance = (minSide * BPS) / total;
+        if (dominant == 0) return BPS;
+
+        uint256 balance = (matched * BPS) / dominant;
 
         uint256 depth;
         if (a.alphaScale == 0) {
             depth = BPS;
         } else {
-            uint256 scaled = (total * BPS) / uint256(a.alphaScale);
-            depth = scaled > BPS ? BPS : scaled;
+            depth = (matched * BPS) / (matched + uint256(a.alphaScale));
         }
 
-        uint256 balanceBoost = balance * 2;
-        if (balanceBoost > BPS) balanceBoost = BPS;
-
-        uint256 cut = (uint256(a.alphaCutBps) * depth * balanceBoost) /
+        uint256 cut = (uint256(a.alphaCutBps) * balance * depth) /
             (BPS * BPS);
 
         if (cut > uint256(a.alphaCutBps)) {
