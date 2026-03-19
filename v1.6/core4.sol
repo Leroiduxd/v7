@@ -61,7 +61,6 @@ library BrokexLibrary {
         uint128 shortMaxProfit;
         uint128 longMaxLoss;
         uint128 shortMaxLoss;
-        uint128 overlapRisk;
         uint128 currentLpLock;
         uint128 needLock;
     }
@@ -1171,8 +1170,6 @@ contract BrokexCore {
         }
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
-
-        _finalizeClose(t, price1e6, tradeId, lotsToClose);
     }
 
     function executeStopOrTakeProfit(
@@ -1338,7 +1335,6 @@ contract BrokexCore {
 
         e.currentLpLock = uint128(baseLock);
         e.needLock = uint128(newNeed);
-        e.overlapRisk = 0;
 
         if (pnlUsd > 0) {
             uint256 gain = uint256(pnlUsd);
