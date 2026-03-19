@@ -338,36 +338,6 @@ library BrokexLibrary {
         return (finalPnl, exitPrice, extraFeesUsdc);
     }
 
-    function computeLockComponents(
-        Exposure storage e
-    ) internal view returns (uint256 grossLock, uint256 overlap) {
-        uint256 avgLong = 0;
-        if (e.longLots > 0) {
-            avgLong = uint256(e.longValueSum) / uint256(uint32(e.longLots));
-        }
-
-        uint256 avgShort = 0;
-        if (e.shortLots > 0) {
-            avgShort = uint256(e.shortValueSum) / uint256(uint32(e.shortLots));
-        }
-
-        uint256 directional = uint256(e.longMaxProfit) >
-            uint256(e.shortMaxProfit)
-            ? uint256(e.longMaxProfit)
-            : uint256(e.shortMaxProfit);
-
-        overlap = 0;
-
-        if (avgShort > avgLong && e.longLots > 0 && e.shortLots > 0) {
-            uint256 matchedLots = uint256(
-                uint32(e.longLots < e.shortLots ? e.longLots : e.shortLots)
-            );
-            overlap = (avgShort - avgLong) * matchedLots;
-        }
-
-        grossLock = directional + overlap;
-    }
-
     function calculateAssetPnlCapped(
         Exposure memory e,
         Asset memory a,
@@ -483,6 +453,10 @@ contract BrokexCore {
     error ShortSlTooLow();
     error PnlUnderCap();
     error NotAuthorized();
+    error AlphaCutTooHigh();
+    error AlphaScaleTooLow();
+    error MinCoverTooLow();
+    error MinGlobalCoverTooLow();
 
     // ----------------------------------------------------------------
     // CONSTANTES & STATE
@@ -504,6 +478,11 @@ contract BrokexCore {
 
     uint256 public totalNeedLock;
     uint16 public minGlobalCoverBps = 9000;
+
+    uint16 public constant MAX_ALPHA_CUT_BPS = 2000;      // alpha min global = 80%
+    uint32 public constant MIN_ALPHA_SCALE = 100;         // à ajuster selon ton unité
+    uint16 public constant MIN_LOCAL_COVER_BPS = 8500;    // 85%
+    uint16 public constant MIN_GLOBAL_COVER_BPS = 9000;   // 90%
 
     // Mappings using Structs from Library
     mapping(uint256 => BrokexLibrary.Trade) public trades;
@@ -719,6 +698,23 @@ contract BrokexCore {
         assets[assetId].allowOpen = _allowOpen;
     }
 
+    function setAssetAlphaParams(
+        uint32 assetId,
+        uint16 newAlphaCutBps,
+        uint32 newAlphaScale,
+        uint16 newMinCoverBps
+    ) external onlyRiskManagerOrOwner {
+        if (!assets[assetId].listed) revert UnknownAsset();
+
+        if (newAlphaCutBps > MAX_ALPHA_CUT_BPS) revert AlphaCutTooHigh();
+        if (newAlphaScale < MIN_ALPHA_SCALE) revert AlphaScaleTooLow();
+        if (newMinCoverBps < MIN_LOCAL_COVER_BPS) revert MinCoverTooLow();
+
+        assets[assetId].alphaCutBps = newAlphaCutBps;
+        assets[assetId].alphaScale = newAlphaScale;
+        assets[assetId].minCoverBps = newMinCoverBps;
+    }
+
     function removeAsset(uint32 assetId) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
         BrokexLibrary.Exposure storage e = exposures[assetId];
@@ -853,7 +849,6 @@ contract BrokexCore {
 
         e.currentLpLock = uint128(newLock);
         e.needLock = uint128(newNeed);
-        e.overlapRisk = 0;
     }
 
     function _needLock(
@@ -1170,6 +1165,8 @@ contract BrokexCore {
         }
 
         uint256 price1e6 = _getVerifiedPrice(oracleProof, t.assetId);
+
+        _finalizeClose(t, price1e6, tradeId, lotsToClose);
     }
 
     function executeStopOrTakeProfit(
