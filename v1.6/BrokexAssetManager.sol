@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-interface IBrokexAssetManager {
+// =========================================================
+// TYPES LIBRARY (standalone, no external import)
+// =========================================================
+library BrokexTypes {
     struct Asset {
         uint32 assetId;
         uint32 numerator;
@@ -22,18 +25,29 @@ interface IBrokexAssetManager {
         bool allowOpen;
         bool listed;
 
-        // --- anti-imbalance / concentration ---
+        // Anti-imbalance / concentration
         uint128 imbalanceBufferUsd6;   // ex: 5_000e6
         uint128 imbalanceKUsd6;        // ex: 10_000e6
         uint16 imbalanceMaxRatioBps;   // ex: 40000 = 4.00x
         uint16 imbalanceMinRatioBps;   // ex: 10500 = 1.05x
         uint16 maxAssetLockBps;        // ex: 1000 = 10%
     }
+}
 
-    function getAsset(uint32 assetId) external view returns (Asset memory);
+// =========================================================
+// INTERFACE
+// =========================================================
+interface IBrokexAssetManager {
+    function getAsset(
+        uint32 assetId
+    ) external view returns (BrokexTypes.Asset memory);
+
     function listedAssetsCount() external view returns (uint256);
 }
 
+// =========================================================
+// CONTRACT
+// =========================================================
 contract BrokexAssetManager is IBrokexAssetManager {
     // =========================================================
     // ERRORS
@@ -51,22 +65,59 @@ contract BrokexAssetManager is IBrokexAssetManager {
     error MinCoverTooLow();
     error BadImbalanceParams();
     error ImbalanceBufferTooLow();
-    error ExposureNotZero(); // gardé si tu veux empêcher remove sur actif "utilisé" via flag externe
-    error AssetNotListed();
 
     // =========================================================
     // EVENTS
     // =========================================================
+    event BrokexLibraryUpdated(address indexed newLibrary);
     event RiskManagerUpdated(address indexed newRiskManager);
+
     event AssetListed(uint32 indexed assetId);
     event AssetRemoved(uint32 indexed assetId);
-    event AssetFeesUpdated(uint32 indexed assetId, uint64 spread, uint32 commission);
-    event AssetFundingUpdated(uint32 indexed assetId, uint64 baseFundingRate, uint64 weekendFunding);
-    event AssetRiskParamsUpdated(uint32 indexed assetId, uint16 securityMultiplier, uint16 maxPhysicalMove, uint8 maxLeverage);
-    event AssetOracleDelayUpdated(uint32 indexed assetId, uint32 maxOracleDelay);
-    event AssetRiskLimitsUpdated(uint32 indexed assetId, uint32 maxLongLots, uint32 maxShortLots);
-    event AssetTradableUpdated(uint32 indexed assetId, bool allowOpen);
-    event AssetAlphaParamsUpdated(uint32 indexed assetId, uint16 alphaCutBps, uint32 alphaScale, uint16 minCoverBps);
+    event AssetLotSizeUpdated(uint32 indexed assetId, uint32 numerator, uint32 denominator);
+
+    event AssetFeesUpdated(
+        uint32 indexed assetId,
+        uint64 spread,
+        uint32 commission
+    );
+
+    event AssetFundingUpdated(
+        uint32 indexed assetId,
+        uint64 baseFundingRate,
+        uint64 weekendFunding
+    );
+
+    event AssetRiskParamsUpdated(
+        uint32 indexed assetId,
+        uint16 securityMultiplier,
+        uint16 maxPhysicalMove,
+        uint8 maxLeverage
+    );
+
+    event AssetOracleDelayUpdated(
+        uint32 indexed assetId,
+        uint32 maxOracleDelay
+    );
+
+    event AssetRiskLimitsUpdated(
+        uint32 indexed assetId,
+        uint32 maxLongLots,
+        uint32 maxShortLots
+    );
+
+    event AssetTradableUpdated(
+        uint32 indexed assetId,
+        bool allowOpen
+    );
+
+    event AssetAlphaParamsUpdated(
+        uint32 indexed assetId,
+        uint16 alphaCutBps,
+        uint32 alphaScale,
+        uint16 minCoverBps
+    );
+
     event AssetImbalanceParamsUpdated(
         uint32 indexed assetId,
         uint128 imbalanceBufferUsd6,
@@ -75,7 +126,6 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint16 imbalanceMinRatioBps,
         uint16 maxAssetLockBps
     );
-    event AssetLotSizeUpdated(uint32 indexed assetId, uint32 numerator, uint32 denominator);
 
     // =========================================================
     // STATE
@@ -83,7 +133,10 @@ contract BrokexAssetManager is IBrokexAssetManager {
     address public immutable owner;
     address public riskManager;
 
-    mapping(uint32 => Asset) internal _assets;
+    // Purely informational / configurable reference
+    address public brokexLibrary;
+
+    mapping(uint32 => BrokexTypes.Asset) internal _assets;
     uint256 public override listedAssetsCount;
 
     // =========================================================
@@ -99,8 +152,8 @@ contract BrokexAssetManager is IBrokexAssetManager {
 
     uint16 public constant DEFAULT_IMBALANCE_MAX_RATIO_BPS = 40000;       // 4.00x
     uint16 public constant DEFAULT_IMBALANCE_MIN_RATIO_BPS = 10500;       // 1.05x
-    uint16 public constant MAX_IMBALANCE_MAX_RATIO_BPS = 40000;           // max autorisé
-    uint16 public constant MIN_IMBALANCE_MIN_RATIO_BPS = 10500;           // min autorisé
+    uint16 public constant MAX_IMBALANCE_MAX_RATIO_BPS = 40000;
+    uint16 public constant MIN_IMBALANCE_MIN_RATIO_BPS = 10500;
     uint16 public constant DEFAULT_MAX_ASSET_LOCK_BPS = 1000;             // 10%
 
     uint32 public constant DEFAULT_MAX_LONG_LOTS = 1_000_000;
@@ -129,13 +182,22 @@ contract BrokexAssetManager is IBrokexAssetManager {
     // =========================================================
     // CONSTRUCTOR
     // =========================================================
-    constructor() {
+    constructor(address _brokexLibrary) {
+        if (_brokexLibrary == address(0)) revert ZeroAddr();
+
         owner = msg.sender;
+        brokexLibrary = _brokexLibrary;
     }
 
     // =========================================================
     // ADMIN
     // =========================================================
+    function setBrokexLibrary(address _brokexLibrary) external onlyOwner {
+        if (_brokexLibrary == address(0)) revert ZeroAddr();
+        brokexLibrary = _brokexLibrary;
+        emit BrokexLibraryUpdated(_brokexLibrary);
+    }
+
     function setRiskManager(address _riskManager) external onlyOwner {
         riskManager = _riskManager;
         emit RiskManagerUpdated(_riskManager);
@@ -144,7 +206,9 @@ contract BrokexAssetManager is IBrokexAssetManager {
     // =========================================================
     // VIEWS
     // =========================================================
-    function getAsset(uint32 assetId) external view override returns (Asset memory) {
+    function getAsset(
+        uint32 assetId
+    ) external view override returns (BrokexTypes.Asset memory) {
         return _assets[assetId];
     }
 
@@ -170,7 +234,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
         if (_assets[assetId].listed) revert AlreadyListed();
         if (numerator == 0 || denominator == 0) revert BadRatio();
 
-        _assets[assetId] = Asset({
+        _assets[assetId] = BrokexTypes.Asset({
             assetId: assetId,
             numerator: numerator,
             denominator: denominator,
@@ -317,7 +381,12 @@ contract BrokexAssetManager is IBrokexAssetManager {
         _assets[assetId].alphaScale = newAlphaScale;
         _assets[assetId].minCoverBps = newMinCoverBps;
 
-        emit AssetAlphaParamsUpdated(assetId, newAlphaCutBps, newAlphaScale, newMinCoverBps);
+        emit AssetAlphaParamsUpdated(
+            assetId,
+            newAlphaCutBps,
+            newAlphaScale,
+            newMinCoverBps
+        );
     }
 
     function setAssetImbalanceParams(
