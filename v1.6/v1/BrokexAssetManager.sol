@@ -26,6 +26,7 @@ interface IBrokexCoreState {
         uint128 currentLpLock,
         uint128 needLock
     );
+    function updateFundingRates(uint32[] calldata assetIds) external;
 }
 
 // ==========================================
@@ -240,6 +241,15 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint64 newWeekendFundingWad
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
+
+        // ✅ Si le core est configuré, on crée un array d'une seule case et on l'appelle
+        if (address(brokexCore) != address(0)) {
+            uint32[] memory ids = new uint32[](1);
+            ids[0] = assetId;
+            brokexCore.updateFundingRates(ids);
+        }
+
+        // ✅ Seulement APRES, on enregistre les nouveaux taux
         assets[assetId].baseFundingRate = newBaseFundingWad;
         assets[assetId].weekendFunding = newWeekendFundingWad;
     }
