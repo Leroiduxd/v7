@@ -1,5 +1,3 @@
----
-
 # Brokex Core — Units and Formula Documentation
 
 ## 1. Numeric Conventions and Units
@@ -659,4 +657,4 @@ Brokex combines multiple layers of protection:
 
 The design goal is to protect LP solvency while still allowing capital-efficient operation when the market is balanced.
 
----
+
