@@ -4,11 +4,28 @@ pragma solidity ^0.8.19;
 import "./BrokexLibrary.sol";
 
 // ==========================================
-// INTERFACE
+// INTERFACES
 // ==========================================
 interface IBrokexAssetManager {
     function getAsset(uint32 assetId) external view returns (BrokexLibrary.Asset memory);
     function listedAssetsCount() external view returns (uint256);
+}
+
+// Interface pour lire l'exposition depuis le Core
+interface IBrokexCoreState {
+    // Getter automatique généré par Solidity pour un public mapping de la struct Exposure
+    function exposures(uint32 assetId) external view returns (
+        int32 longLots,
+        int32 shortLots,
+        uint128 longValueSum,
+        uint128 shortValueSum,
+        uint128 longMaxProfit,
+        uint128 shortMaxProfit,
+        uint128 longMaxLoss,
+        uint128 shortMaxLoss,
+        uint128 currentLpLock,
+        uint128 needLock
+    );
 }
 
 // ==========================================
@@ -31,29 +48,33 @@ contract BrokexAssetManager is IBrokexAssetManager {
     error MinCoverTooLow();
     error BadImbalanceParams();
     error ImbalanceBufferTooLow();
-    error ExposureNotZero(); // Utilisé lors de la suppression/modification structurante
+    error ExposureNotZero(); // Revert si exposition ouverte
+    error CoreAlreadySet();
 
     // ----------------------------------------------------------------
     // STATE & CONSTANTS
     // ----------------------------------------------------------------
     address public immutable owner;
     address public riskManager;
+    
+    // Ajout de la référence vers le Core
+    IBrokexCoreState public brokexCore;
 
     mapping(uint32 => BrokexLibrary.Asset) public assets;
     uint256 public override listedAssetsCount;
 
-    uint128 public constant MIN_IMBALANCE_BUFFER_USD6 = 1_000 * 1e6;       // 1 000$
-    uint128 public constant DEFAULT_IMBALANCE_BUFFER_USD6 = 5_000 * 1e6;   // proposition par défaut
-    uint128 public constant DEFAULT_IMBALANCE_K_USD6 = 10_000 * 1e6;       // agressif mais pas extrême
+    uint128 public constant MIN_IMBALANCE_BUFFER_USD6 = 1_000 * 1e6;
+    uint128 public constant DEFAULT_IMBALANCE_BUFFER_USD6 = 5_000 * 1e6;
+    uint128 public constant DEFAULT_IMBALANCE_K_USD6 = 10_000 * 1e6;
 
-    uint16 public constant DEFAULT_IMBALANCE_MAX_RATIO_BPS = 40000;        // 4.00x
-    uint16 public constant DEFAULT_IMBALANCE_MIN_RATIO_BPS = 10500;        // 1.05x
-    uint16 public constant MAX_IMBALANCE_MAX_RATIO_BPS = 40000;            // borne haute autorisée
-    uint16 public constant MIN_IMBALANCE_MIN_RATIO_BPS = 10500;            // borne basse autorisée
-    uint16 public constant DEFAULT_MAX_ASSET_LOCK_BPS = 1000;              // 10%
-    uint16 public constant MAX_ALPHA_CUT_BPS = 2000;                       // alpha min global = 80%
-    uint32 public constant MIN_ALPHA_SCALE = 100;                          // à ajuster selon ton unité
-    uint16 public constant MIN_LOCAL_COVER_BPS = 8500;                     // 85%
+    uint16 public constant DEFAULT_IMBALANCE_MAX_RATIO_BPS = 40000;
+    uint16 public constant DEFAULT_IMBALANCE_MIN_RATIO_BPS = 10500;
+    uint16 public constant MAX_IMBALANCE_MAX_RATIO_BPS = 40000;
+    uint16 public constant MIN_IMBALANCE_MIN_RATIO_BPS = 10500;
+    uint16 public constant DEFAULT_MAX_ASSET_LOCK_BPS = 1000;
+    uint16 public constant MAX_ALPHA_CUT_BPS = 2000;
+    uint32 public constant MIN_ALPHA_SCALE = 100;
+    uint16 public constant MIN_LOCAL_COVER_BPS = 8500;
 
     // ----------------------------------------------------------------
     // MODIFIERS
@@ -83,11 +104,29 @@ contract BrokexAssetManager is IBrokexAssetManager {
         riskManager = _riskManager;
     }
 
+    // Lie ce contrat au Core pour pouvoir lire les expositions
+    function setBrokexCore(address _core) external onlyOwner {
+        // On bloque si l'adresse a déjà été configurée
+        if (address(brokexCore) != address(0)) revert CoreAlreadySet();
+        if (_core == address(0)) revert ZeroAddr();
+        
+        brokexCore = IBrokexCoreState(_core);
+    }
+
     // ----------------------------------------------------------------
     // VIEWS
     // ----------------------------------------------------------------
     function getAsset(uint32 assetId) external view override returns (BrokexLibrary.Asset memory) {
         return assets[assetId];
+    }
+
+    // Vérifie qu'aucune position n'est ouverte sur l'actif
+    function _checkZeroExposure(uint32 assetId) internal view {
+        // On s'assure que le core est bien configuré avant de faire l'appel
+        if (address(brokexCore) != address(0)) {
+            (int32 longLots, int32 shortLots, , , , , , , , ) = brokexCore.exposures(assetId);
+            if (longLots != 0 || shortLots != 0) revert ExposureNotZero();
+        }
     }
 
     // ----------------------------------------------------------------
@@ -137,6 +176,31 @@ contract BrokexAssetManager is IBrokexAssetManager {
         listedAssetsCount++;
     }
 
+    function removeAsset(uint32 assetId) external onlyOwner {
+        if (!assets[assetId].listed) revert UnknownAsset();
+        
+        // Bloque la suppression si des lots sont ouverts
+        _checkZeroExposure(assetId);
+        
+        delete assets[assetId];
+        listedAssetsCount--; // Ne pas oublier de décrémenter le compteur de listing
+    }
+
+    function updateLotSize(
+        uint32 assetId,
+        uint32 newNum,
+        uint32 newDen
+    ) external onlyOwner {
+        if (!assets[assetId].listed) revert UnknownAsset();
+        if (newNum == 0 || newDen == 0) revert BadRatio();
+        
+        // Bloque le changement de num/den si des lots sont ouverts (empêche les bugs de PnL)
+        _checkZeroExposure(assetId);
+        
+        assets[assetId].numerator = newNum;
+        assets[assetId].denominator = newDen;
+    }
+
     function setAssetFees(
         uint32 assetId,
         uint64 newSpreadWad,
@@ -176,7 +240,6 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint64 newWeekendFundingWad
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
-        // Core s'occupe de l'update _updateFundingRate via l'appel. Le manager met juste à jour la constante.
         assets[assetId].baseFundingRate = newBaseFundingWad;
         assets[assetId].weekendFunding = newWeekendFundingWad;
     }
@@ -235,20 +298,5 @@ contract BrokexAssetManager is IBrokexAssetManager {
         assets[assetId].alphaCutBps = newAlphaCutBps;
         assets[assetId].alphaScale = newAlphaScale;
         assets[assetId].minCoverBps = newMinCoverBps;
-    }
-
-    function removeAsset(uint32 assetId) external onlyOwner {
-        if (!assets[assetId].listed) revert UnknownAsset();
-        delete assets[assetId];
-    }
-
-    function updateLotSize(
-        uint32 assetId,
-        uint32 newNum,
-        uint32 newDen
-    ) external onlyOwner {
-        if (!assets[assetId].listed) revert UnknownAsset();
-        assets[assetId].numerator = newNum;
-        assets[assetId].denominator = newDen;
     }
 }
