@@ -193,7 +193,9 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint32 newDen
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
-        if (newNum == 0 || newDen == 0) revert BadRatio();
+        
+        // ✅ Vérification explicite : le numérateur et le dénominateur doivent être au moins à 1
+        if (newNum < 1 || newDen < 1) revert BadRatio();
         
         // Bloque le changement de num/den si des lots sont ouverts (empêche les bugs de PnL)
         _checkZeroExposure(assetId);
