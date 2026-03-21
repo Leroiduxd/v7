@@ -178,13 +178,18 @@ contract BrokexAssetManager is IBrokexAssetManager {
     }
 
     function removeAsset(uint32 assetId) external onlyOwner {
+        // 1. On vérifie qu'il est bien listé AVANT de faire quoi que ce soit.
+        // Si ce n'est pas le cas, ça revert et le compteur n'est pas touché.
         if (!assets[assetId].listed) revert UnknownAsset();
         
-        // Bloque la suppression si des lots sont ouverts
+        // 2. On s'assure qu'il n'y a aucune position ouverte (sécurité PnL).
         _checkZeroExposure(assetId);
         
+        // 3. On supprime les données de l'actif (ce qui remet notamment `listed` à false).
         delete assets[assetId];
-        listedAssetsCount--; // Ne pas oublier de décrémenter le compteur de listing
+        
+        // 4. L'unlisting a réussi, on peut réduire le compteur en toute sécurité.
+        listedAssetsCount--; 
     }
 
     function updateLotSize(
