@@ -51,6 +51,8 @@ contract BrokexAssetManager is IBrokexAssetManager {
     error ImbalanceBufferTooLow();
     error ExposureNotZero(); // Revert si exposition ouverte
     error CoreAlreadySet();
+    error BadSecurityMultiplier();
+    error BadMaxPhysicalMove();
 
     // ----------------------------------------------------------------
     // STATE & CONSTANTS
@@ -76,6 +78,11 @@ contract BrokexAssetManager is IBrokexAssetManager {
     uint16 public constant MAX_ALPHA_CUT_BPS = 2000;
     uint64 public constant MIN_ALPHA_SCALE = 100;
     uint16 public constant MIN_LOCAL_COVER_BPS = 8500;
+    uint16 public constant MIN_SECURITY_MULTIPLIER = 100;
+    uint16 public constant MAX_SECURITY_MULTIPLIER = 1000;
+    
+    uint16 public constant MIN_MAX_PHYSICAL_MOVE = 1;
+    uint16 public constant MAX_MAX_PHYSICAL_MOVE = 100;
 
     // ----------------------------------------------------------------
     // MODIFIERS
@@ -147,6 +154,15 @@ contract BrokexAssetManager is IBrokexAssetManager {
     ) external onlyOwner {
         if (assets[assetId].listed) revert AlreadyListed();
         if (numerator == 0 || denominator == 0) revert BadRatio();
+        if (
+            securityMultiplier < MIN_SECURITY_MULTIPLIER ||
+            securityMultiplier > MAX_SECURITY_MULTIPLIER
+        ) revert BadSecurityMultiplier();
+        
+        if (
+            maxPhysicalMove < MIN_MAX_PHYSICAL_MOVE ||
+            maxPhysicalMove > MAX_MAX_PHYSICAL_MOVE
+        ) revert BadMaxPhysicalMove();
 
         assets[assetId] = BrokexLibrary.Asset({
             assetId: assetId,
@@ -268,6 +284,17 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint8 newMaxLev
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
+    
+        if (
+            newSecMult < MIN_SECURITY_MULTIPLIER ||
+            newSecMult > MAX_SECURITY_MULTIPLIER
+        ) revert BadSecurityMultiplier();
+    
+        if (
+            newMaxPhys < MIN_MAX_PHYSICAL_MOVE ||
+            newMaxPhys > MAX_MAX_PHYSICAL_MOVE
+        ) revert BadMaxPhysicalMove();
+    
         assets[assetId].securityMultiplier = newSecMult;
         assets[assetId].maxPhysicalMove = newMaxPhys;
         assets[assetId].maxLeverage = newMaxLev;
@@ -311,7 +338,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
         if (newAlphaCutBps > MAX_ALPHA_CUT_BPS) revert AlphaCutTooHigh();
         if (newAlphaScale < MIN_ALPHA_SCALE) revert AlphaScaleTooLow();
         if (newMinCoverBps < MIN_LOCAL_COVER_BPS) revert MinCoverTooLow();
-
+    
         assets[assetId].alphaCutBps = newAlphaCutBps;
         assets[assetId].alphaScale = newAlphaScale;
         assets[assetId].minCoverBps = newMinCoverBps;
