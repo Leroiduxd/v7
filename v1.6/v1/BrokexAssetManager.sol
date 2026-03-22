@@ -303,20 +303,21 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint64 newWeekendFundingWad
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
-    
+
         if (newBaseFundingWad > MAX_BASE_FUNDING_WAD) revert BadFundingRate();
         if (newWeekendFundingWad > MAX_WEEKEND_FUNDING_WAD) revert BadWeekendFunding();
-    
+
         if (address(brokexCore) != address(0)) {
-            uint32;
+            // Correction : Déclaration et initialisation correctes du tableau en mémoire
+            uint32[] memory ids = new uint32[](1);
             ids[0] = assetId;
             brokexCore.updateFundingRates(ids);
         }
-    
+
         assets[assetId].baseFundingRate = newBaseFundingWad;
         assets[assetId].weekendFunding = newWeekendFundingWad;
     }
-
+    
     function setAssetRiskParams(
         uint32 assetId,
         uint16 newSecMult,
