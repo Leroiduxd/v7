@@ -42,7 +42,7 @@ library BrokexLibrary {
         uint32 maxShortLots;
         uint32 maxOracleDelay;
         uint16 alphaCutBps;
-        uint32 alphaScale;
+        uint64 alphaScale;
         uint16 minCoverBps;
         bool allowOpen;
         bool listed;
