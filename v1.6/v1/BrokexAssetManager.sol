@@ -74,7 +74,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
     uint16 public constant MIN_IMBALANCE_MIN_RATIO_BPS = 10500;
     uint16 public constant DEFAULT_MAX_ASSET_LOCK_BPS = 1000;
     uint16 public constant MAX_ALPHA_CUT_BPS = 2000;
-    uint32 public constant MIN_ALPHA_SCALE = 100;
+    uint64 public constant MIN_ALPHA_SCALE = 100;
     uint16 public constant MIN_LOCAL_COVER_BPS = 8500;
 
     // ----------------------------------------------------------------
@@ -304,7 +304,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
     function setAssetAlphaParams(
         uint32 assetId,
         uint16 newAlphaCutBps,
-        uint32 newAlphaScale,
+        uint64 newAlphaScale,
         uint16 newMinCoverBps
     ) external onlyRiskManagerOrOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
