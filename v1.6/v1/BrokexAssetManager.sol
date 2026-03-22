@@ -53,6 +53,12 @@ contract BrokexAssetManager is IBrokexAssetManager {
     error CoreAlreadySet();
     error BadSecurityMultiplier();
     error BadMaxPhysicalMove();
+    error BadMaxLeverage();
+    error BadSpread();
+    error BadFundingRate();
+    error BadWeekendFunding();
+    error BadCommission();
+    error MinCoverTooHigh();
 
     // ----------------------------------------------------------------
     // STATE & CONSTANTS
@@ -83,6 +89,14 @@ contract BrokexAssetManager is IBrokexAssetManager {
     
     uint16 public constant MIN_MAX_PHYSICAL_MOVE = 1;
     uint16 public constant MAX_MAX_PHYSICAL_MOVE = 100;
+
+    uint8  public constant MAX_MAX_LEVERAGE = 200;
+    
+    uint64 public constant MAX_SPREAD_WAD = 5e15;            // 0.5%
+    uint64 public constant MAX_BASE_FUNDING_WAD = 1e15;      // 0.1%
+    uint64 public constant MAX_WEEKEND_FUNDING_WAD = 15e15;  // 1.5%
+    
+    uint32 public constant MAX_COMMISSION_BPS = 50;          // 0.5%
 
     // ----------------------------------------------------------------
     // MODIFIERS
@@ -154,16 +168,37 @@ contract BrokexAssetManager is IBrokexAssetManager {
     ) external onlyOwner {
         if (assets[assetId].listed) revert AlreadyListed();
         if (numerator == 0 || denominator == 0) revert BadRatio();
+    
         if (
             securityMultiplier < MIN_SECURITY_MULTIPLIER ||
             securityMultiplier > MAX_SECURITY_MULTIPLIER
         ) revert BadSecurityMultiplier();
-        
+    
         if (
             maxPhysicalMove < MIN_MAX_PHYSICAL_MOVE ||
             maxPhysicalMove > MAX_MAX_PHYSICAL_MOVE
         ) revert BadMaxPhysicalMove();
-
+    
+        if (maxLeverage == 0 || maxLeverage > MAX_MAX_LEVERAGE) {
+            revert BadMaxLeverage();
+        }
+    
+        if (spread > MAX_SPREAD_WAD) {
+            revert BadSpread();
+        }
+    
+        if (baseFundingRate > MAX_BASE_FUNDING_WAD) {
+            revert BadFundingRate();
+        }
+    
+        if (weekendFunding > MAX_WEEKEND_FUNDING_WAD) {
+            revert BadWeekendFunding();
+        }
+    
+        if (commission > MAX_COMMISSION_BPS) {
+            revert BadCommission();
+        }
+    
         assets[assetId] = BrokexLibrary.Asset({
             assetId: assetId,
             numerator: numerator,
@@ -179,7 +214,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
             maxShortLots: 1000000,
             maxOracleDelay: 60,
             alphaCutBps: 0,
-            alphaScale: 1000000,
+            alphaScale: 5_000 * 1e6,
             minCoverBps: 10000,
             allowOpen: true,
             listed: true,
@@ -189,7 +224,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
             imbalanceMinRatioBps: DEFAULT_IMBALANCE_MIN_RATIO_BPS,
             maxAssetLockBps: DEFAULT_MAX_ASSET_LOCK_BPS
         });
-
+    
         listedAssetsCount++;
     }
 
