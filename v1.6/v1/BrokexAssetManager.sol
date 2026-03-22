@@ -266,6 +266,10 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint32 newCommission
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
+    
+        if (newSpreadWad > MAX_SPREAD_WAD) revert BadSpread();
+        if (newCommission > MAX_COMMISSION_BPS) revert BadCommission();
+    
         assets[assetId].spread = newSpreadWad;
         assets[assetId].commission = newCommission;
     }
@@ -299,15 +303,16 @@ contract BrokexAssetManager is IBrokexAssetManager {
         uint64 newWeekendFundingWad
     ) external onlyOwner {
         if (!assets[assetId].listed) revert UnknownAsset();
-
-        // ✅ Si le core est configuré, on crée un array d'une seule case et on l'appelle
+    
+        if (newBaseFundingWad > MAX_BASE_FUNDING_WAD) revert BadFundingRate();
+        if (newWeekendFundingWad > MAX_WEEKEND_FUNDING_WAD) revert BadWeekendFunding();
+    
         if (address(brokexCore) != address(0)) {
-            uint32[] memory ids = new uint32[](1);
+            uint32;
             ids[0] = assetId;
             brokexCore.updateFundingRates(ids);
         }
-
-        // ✅ Seulement APRES, on enregistre les nouveaux taux
+    
         assets[assetId].baseFundingRate = newBaseFundingWad;
         assets[assetId].weekendFunding = newWeekendFundingWad;
     }
@@ -330,11 +335,14 @@ contract BrokexAssetManager is IBrokexAssetManager {
             newMaxPhys > MAX_MAX_PHYSICAL_MOVE
         ) revert BadMaxPhysicalMove();
     
+        if (newMaxLev == 0 || newMaxLev > MAX_MAX_LEVERAGE) {
+            revert BadMaxLeverage();
+        }
+    
         assets[assetId].securityMultiplier = newSecMult;
         assets[assetId].maxPhysicalMove = newMaxPhys;
         assets[assetId].maxLeverage = newMaxLev;
     }
-
     function setAssetOracleDelay(
         uint32 assetId,
         uint32 newDelay
@@ -373,6 +381,7 @@ contract BrokexAssetManager is IBrokexAssetManager {
         if (newAlphaCutBps > MAX_ALPHA_CUT_BPS) revert AlphaCutTooHigh();
         if (newAlphaScale < MIN_ALPHA_SCALE) revert AlphaScaleTooLow();
         if (newMinCoverBps < MIN_LOCAL_COVER_BPS) revert MinCoverTooLow();
+        if (newMinCoverBps > 10000) revert MinCoverTooHigh();
     
         assets[assetId].alphaCutBps = newAlphaCutBps;
         assets[assetId].alphaScale = newAlphaScale;
