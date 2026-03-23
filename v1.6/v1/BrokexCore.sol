@@ -376,28 +376,32 @@ contract BrokexCore {
         f.lastUpdate = uint64(block.timestamp);
     }
 
-    function _checkOpenImbalance(
+    function _checkAssetConcentration(
         uint32 assetId,
         bool isLong,
-        uint256 addedMaxProfit
+        uint256 addedMaxProfit,
+        uint256 addedMargin
     ) internal view {
         BrokexLibrary.Asset memory a = assetManager.getAsset(assetId);
-
-        (
-            bool allowed,
-            ,
-            ,
-            ,
-            ,
-            
-        ) = BrokexLibrary.checkOpenImbalanceAfterAdd(
-                a,
-                exposures[assetId],
-                isLong,
-                addedMaxProfit
-            );
-
-        if (!allowed) revert OpenImbalanceTooHigh();
+        BrokexLibrary.Exposure memory e = exposures[assetId];
+    
+        (uint256 newNeedLock, ) = BrokexLibrary.computeNeedLockAfterOpen(
+            a,
+            e,
+            isLong,
+            addedMaxProfit,
+            addedMargin
+        );
+    
+        uint256 totalLpCapital = brokexVault.lpFreeCapital() +
+            brokexVault.lpLockedCapital();
+    
+        if (totalLpCapital == 0) revert AssetConcentrationTooHigh();
+    
+        uint256 maxAllowedForAsset = (totalLpCapital * uint256(a.maxAssetLockBps)) /
+            10000;
+    
+        if (newNeedLock > maxAllowedForAsset) revert AssetConcentrationTooHigh();
     }
 
     function _checkAssetConcentration(
