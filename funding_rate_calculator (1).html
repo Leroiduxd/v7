@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Brokex Funding Rate Calculator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f1115;
+      color: #f5f5f5;
+      margin: 0;
+      padding: 40px;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: auto;
+      background: #171a21;
+      border: 1px solid #2a2f3a;
+      border-radius: 16px;
+      padding: 28px;
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 24px;
+    }
+
+    label {
+      display: block;
+      margin-top: 18px;
+      margin-bottom: 6px;
+      color: #b8bcc7;
+    }
+
+    input {
+      width: 100%;
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid #343a46;
+      background: #0f1115;
+      color: white;
+      font-size: 16px;
+      box-sizing: border-box;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .results {
+      margin-top: 28px;
+      padding: 20px;
+      background: #10131a;
+      border-radius: 14px;
+      border: 1px solid #2a2f3a;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      margin: 12px 0;
+      gap: 20px;
+    }
+
+    .muted {
+      color: #9ca3af;
+    }
+
+    .big {
+      font-size: 22px;
+      font-weight: bold;
+    }
+
+    .charts {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 22px;
+      margin-top: 24px;
+    }
+
+    canvas {
+      width: 100%;
+      height: 360px;
+      background: #10131a;
+      border: 1px solid #2a2f3a;
+      border-radius: 14px;
+      padding: 12px;
+      box-sizing: border-box;
+    }
+
+    .formula {
+      margin-top: 22px;
+      padding: 14px;
+      background: #0f1115;
+      border-radius: 10px;
+      color: #b8bcc7;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 800px) {
+      .grid { grid-template-columns: 1fr; }
+      body { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Brokex Funding Rate Calculator</h1>
+
+    <div class="grid">
+      <div>
+        <label>Open Interest Long ($)</label>
+        <input id="longOi" type="number" value="8000" min="0" step="1" />
+      </div>
+
+      <div>
+        <label>Open Interest Short ($)</label>
+        <input id="shortOi" type="number" value="15000" min="0" step="1" />
+      </div>
+
+      <div>
+        <label>Base Funding annuel (%)</label>
+        <input id="baseFunding" type="number" value="5" min="0" step="0.01" />
+      </div>
+
+      <div>
+        <label>Base Spread (%)</label>
+        <input id="baseSpread" type="number" value="0.06" min="0" step="0.001" />
+      </div>
+
+      <div>
+        <label>Buffer ($)</label>
+        <input id="buffer" type="number" value="2000" min="0" step="100" />
+      </div>
+
+      <div>
+        <label>K ($)</label>
+        <input id="kValue" type="number" value="8000" min="1" step="100" />
+      </div>
+
+      <div>
+        <label>Ratio max au buffer</label>
+        <input id="maxRatio" type="number" value="1.5" min="1" step="0.01" />
+      </div>
+
+      <div>
+        <label>Ratio min en haut</label>
+        <input id="minRatio" type="number" value="1.1" min="1" step="0.01" />
+      </div>
+
+      <div>
+        <label>Alpha min</label>
+        <input id="alphaMin" type="number" value="0.7" min="0" max="1" step="0.01" />
+      </div>
+
+      <div>
+        <label>Alpha scale ($)</label>
+        <input id="alphaScale" type="number" value="5000" min="1" step="100" />
+      </div>
+    </div>
+
+    <div class="results">
+      <div class="row">
+        <span class="muted">Côté dominant</span>
+        <span id="dominantSide" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Skew r</span>
+        <span id="skew">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Funding Long annuel</span>
+        <span id="longFunding" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Funding Short annuel</span>
+        <span id="shortFunding" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Funding Long / jour</span>
+        <span id="longDaily">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Funding Short / jour</span>
+        <span id="shortDaily">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Funding Long / heure</span>
+        <span id="longHourly">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Funding Short / heure</span>
+        <span id="shortHourly">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Spread Long</span>
+        <span id="longSpread" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Spread Short</span>
+        <span id="shortSpread" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Ratio autorisé long/short</span>
+        <span id="allowedRatio" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Ouverture autorisée ?</span>
+        <span id="imbalanceOk" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">Alpha</span>
+        <span id="alphaValue" class="big">-</span>
+      </div>
+
+      <div class="row">
+        <span class="muted">NeedLock estimé</span>
+        <span id="needLock" class="big">-</span>
+      </div>
+    </div>
+
+    <div class="charts">
+      <canvas id="chartFunding"></canvas>
+      <canvas id="chartSpread"></canvas>
+      <canvas id="chartRisk"></canvas>
+    </div>
+
+    <div class="formula">
+      <b>Funding</b><br>
+      r = |Long - Short| / (Long + Short)<br>
+      p = r² × (3 - 2r)  (smoothstep)<br>
+      dominantFunding = baseFunding × (0.5 + 9.5p)<br>
+      minorityFunding = baseFunding × (0.5 - 0.2p)<br><br>
+
+      <b>Spread</b><br>
+      dominantSpread = baseSpread × (1 + 3p)<br>
+      minoritySpread = baseSpread × (1 - 0.2p)<br><br>
+
+      <b>Buffer + K</b><br>
+      si T ≤ buffer : allowedRatio = maxRatio<br>
+      sinon : x = T - buffer<br>
+      allowedRatio = minRatio + (maxRatio - minRatio) × K² / (x² + K²)<br>
+      condition : dominant ≤ minority × allowedRatio<br><br>
+
+      <b>Alpha / NeedLock</b><br>
+      matched = min(longRisk, shortRisk)<br>
+      dominant = max(longRisk, shortRisk)<br>
+      balance = matched / dominant<br>
+      depth = matched / (matched + alphaScale)<br>
+      alpha = 1 - (1 - alphaMin) × balance × depth<br>
+      needLock = dominant × alpha
+    </div>
+  </div>
+
+  <script>
+    const longInput = document.getElementById("longOi");
+    const shortInput = document.getElementById("shortOi");
+    const baseInput = document.getElementById("baseFunding");
+    const spreadInput = document.getElementById("baseSpread");
+    const bufferInput = document.getElementById("buffer");
+    const kInput = document.getElementById("kValue");
+    const maxRatioInput = document.getElementById("maxRatio");
+    const minRatioInput = document.getElementById("minRatio");
+    const alphaMinInput = document.getElementById("alphaMin");
+    const alphaScaleInput = document.getElementById("alphaScale");
+
+    function formatPct(value) {
+      return value.toFixed(4) + "%";
+    }
+
+    function fundingRates(L, S, base) {
+      const total = L + S;
+
+      if (total === 0) {
+        return {
+          dominantSide: "Aucun",
+          r: 0,
+          longFunding: base * 0.5,
+          shortFunding: base * 0.5
+        };
+      }
+
+      const r = Math.abs(L - S) / total;
+      const p = r * r * (3 - 2 * r); // smoothstep
+
+      const dominantFunding = base * (0.5 + 9.5 * p);
+      const minorityFunding = base * (0.5 - 0.2 * p);
+
+      if (L > S) {
+        return { dominantSide: "Long", r, longFunding: dominantFunding, shortFunding: minorityFunding };
+      }
+
+      if (S > L) {
+        return { dominantSide: "Short", r, longFunding: minorityFunding, shortFunding: dominantFunding };
+      }
+
+      return {
+        dominantSide: "Équilibré",
+        r,
+        longFunding: base * 0.5,
+        shortFunding: base * 0.5
+      };
+    }
+
+    function spreadRates(L, S, baseSpread) {
+      const total = L + S;
+
+      if (total === 0) {
+        return { longSpread: baseSpread, shortSpread: baseSpread };
+      }
+
+      const r = Math.abs(L - S) / total;
+      const p = r * r * (3 - 2 * r); // same smoothstep curve, softer intensity
+
+      const dominantSpread = baseSpread * (1 + 3 * p);     // max 4x base
+      const minoritySpread = baseSpread * (1 - 0.2 * p);   // min 0.8x base
+
+      if (L > S) return { longSpread: dominantSpread, shortSpread: minoritySpread };
+      if (S > L) return { longSpread: minoritySpread, shortSpread: dominantSpread };
+      return { longSpread: baseSpread, shortSpread: baseSpread };
+    }
+
+    function allowedRatio(total, buffer, k, maxRatio, minRatio) {
+      if (total <= buffer) return maxRatio;
+      const x = total - buffer;
+      return minRatio + (maxRatio - minRatio) * ((k * k) / (x * x + k * k));
+    }
+
+    function alphaAndNeedLock(L, S, alphaMin, alphaScale) {
+      const matched = Math.min(L, S);
+      const dominant = Math.max(L, S);
+      if (dominant === 0) return { alpha: 1, needLock: 0 };
+
+      const balance = matched / dominant;
+      const depth = matched / (matched + alphaScale);
+      const alpha = 1 - (1 - alphaMin) * balance * depth;
+      return { alpha, needLock: dominant * alpha };
+    }
+
+    function imbalanceCheck(L, S, ratio) {
+      const dominant = Math.max(L, S);
+      const minority = Math.min(L, S);
+      if (dominant === 0) return true;
+      if (minority === 0) return false;
+      return dominant <= minority * ratio;
+    }
+
+    function calculate() {
+      const L = Number(longInput.value) || 0;
+      const S = Number(shortInput.value) || 0;
+      const base = Number(baseInput.value) || 0;
+      const baseSpread = Number(spreadInput.value) || 0;
+      const buffer = Number(bufferInput.value) || 0;
+      const k = Number(kInput.value) || 1;
+      const maxRatio = Number(maxRatioInput.value) || 1.5;
+      const minRatio = Number(minRatioInput.value) || 1.1;
+      const alphaMin = Number(alphaMinInput.value) || 0.7;
+      const alphaScale = Number(alphaScaleInput.value) || 1;
+
+      const result = fundingRates(L, S, base);
+      const spread = spreadRates(L, S, baseSpread);
+      const ratio = allowedRatio(L + S, buffer, k, maxRatio, minRatio);
+      const ok = imbalanceCheck(L, S, ratio);
+      const risk = alphaAndNeedLock(L * 0.10, S * 0.10, alphaMin, alphaScale);
+
+      document.getElementById("dominantSide").textContent = result.dominantSide;
+      document.getElementById("skew").textContent = result.r.toFixed(4);
+      document.getElementById("longFunding").textContent = formatPct(result.longFunding);
+      document.getElementById("shortFunding").textContent = formatPct(result.shortFunding);
+      document.getElementById("longDaily").textContent = formatPct(result.longFunding / 365);
+      document.getElementById("shortDaily").textContent = formatPct(result.shortFunding / 365);
+      document.getElementById("longHourly").textContent = formatPct(result.longFunding / 365 / 24);
+      document.getElementById("shortHourly").textContent = formatPct(result.shortFunding / 365 / 24);
+      document.getElementById("longSpread").textContent = formatPct(spread.longSpread);
+      document.getElementById("shortSpread").textContent = formatPct(spread.shortSpread);
+      document.getElementById("allowedRatio").textContent = ratio.toFixed(3) + "x";
+      document.getElementById("imbalanceOk").textContent = ok ? "Oui" : "Non";
+      document.getElementById("alphaValue").textContent = (risk.alpha * 100).toFixed(2) + "%";
+      document.getElementById("needLock").textContent = "$" + risk.needLock.toFixed(2);
+
+      drawCharts();
+    }
+
+    function drawLineChart(canvas, title, labels, longValues, shortValues, yLabel, mode = "funding") {
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const w = rect.width;
+      const h = rect.height;
+      const pad = 48;
+      const top = 42;
+      const right = 24;
+      const plotW = w - pad - right;
+      const plotH = h - top - pad;
+
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#10131a";
+      ctx.fillRect(0, 0, w, h);
+
+      const maxY = Math.max(...longValues, ...shortValues, 0.01) * 1.1;
+      const maxX = labels[labels.length - 1];
+
+      function xPos(x) {
+        return pad + (x / maxX) * plotW;
+      }
+
+      function yPos(y) {
+        return top + plotH - (y / maxY) * plotH;
+      }
+
+      // grid
+      ctx.strokeStyle = "#252b36";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#9ca3af";
+      ctx.font = "12px Arial";
+
+      for (let i = 0; i <= 5; i++) {
+        const y = top + (plotH / 5) * i;
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(w - right, y);
+        ctx.stroke();
+
+        const val = maxY - (maxY / 5) * i;
+        ctx.fillText(val.toFixed(2) + "%", 8, y + 4);
+      }
+
+      for (let i = 0; i <= 5; i++) {
+        const x = pad + (plotW / 5) * i;
+        ctx.beginPath();
+        ctx.moveTo(x, top);
+        ctx.lineTo(x, top + plotH);
+        ctx.stroke();
+
+        const val = (maxX / 5) * i;
+        ctx.fillText((val / 1000).toFixed(0) + "k", x - 10, h - 18);
+      }
+
+      ctx.fillStyle = "#f5f5f5";
+      ctx.font = "16px Arial";
+      ctx.fillText(title, pad, 24);
+
+      function draw(values, color) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+
+        values.forEach((v, i) => {
+          const x = xPos(labels[i]);
+          const y = yPos(v);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+
+        ctx.stroke();
+      }
+
+      draw(longValues, "#60a5fa");
+      draw(shortValues, "#f87171");
+
+      // Hover interaction
+      canvas.onmousemove = function (e) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+
+        const ratio = (mouseX - pad) / plotW;
+        if (ratio < 0 || ratio > 1) return;
+
+        const index = Math.round(ratio * (labels.length - 1));
+
+        const x = xPos(labels[index]);
+        const yLong = yPos(longValues[index]);
+        const yShort = yPos(shortValues[index]);
+
+        drawLineChart(canvas, title, labels, longValues, shortValues, yLabel, mode);
+
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(x, yLong, 4, 0, 2 * Math.PI);
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(x, yShort, 4, 0, 2 * Math.PI);
+        ctx.fill();
+
+        ctx.fillStyle = "#000";
+        ctx.fillRect(x + 10, yLong - 30, 140, 40);
+        ctx.fillStyle = "#fff";
+        ctx.font = "12px Arial";
+        ctx.fillText(`OI: ${labels[index].toLocaleString()}$`, x + 15, yLong - 15);
+
+        if (mode === "funding") {
+          const longDaily = longValues[index];
+          const shortDaily = shortValues[index];
+          const longAnnual = longDaily * 365;
+          const shortAnnual = shortDaily * 365;
+
+          ctx.fillText(`Long annuel: ${longAnnual.toFixed(2)}%`, x + 15, yLong - 5);
+          ctx.fillText(`Long jour: ${longDaily.toFixed(4)}%`, x + 15, yLong + 10);
+          ctx.fillText(`Short annuel: ${shortAnnual.toFixed(2)}%`, x + 15, yLong + 25);
+          ctx.fillText(`Short jour: ${shortDaily.toFixed(4)}%`, x + 15, yLong + 40);
+        } else {
+          ctx.fillText(`Long spread: ${longValues[index].toFixed(4)}%`, x + 15, yLong - 5);
+          ctx.fillText(`Short spread: ${shortValues[index].toFixed(4)}%`, x + 15, yLong + 10);
+        }
+      };
+    }
+
+    function drawCharts() {
+      const base = Number(baseInput.value) || 0;
+      const baseSpread = Number(spreadInput.value) || 0;
+      const fixedShort = Number(shortInput.value) || 0;
+      const buffer = Number(bufferInput.value) || 0;
+      const k = Number(kInput.value) || 1;
+      const maxRatio = Number(maxRatioInput.value) || 1.5;
+      const minRatio = Number(minRatioInput.value) || 1.1;
+      const alphaMin = Number(alphaMinInput.value) || 0.7;
+      const alphaScale = Number(alphaScaleInput.value) || 1;
+      const max = 150000;
+      const step = 2500;
+
+      const labels = [];
+      const fundingLong = [];
+      const fundingShort = [];
+      const spreadLong = [];
+      const spreadShort = [];
+      const ratioValues = [];
+      const alphaValues = [];
+      const needLockValues = [];
+
+      for (let x = 0; x <= max; x += step) {
+        labels.push(x);
+
+        const f = fundingRates(x, fixedShort, base);
+        fundingLong.push(f.longFunding / 365);
+        fundingShort.push(f.shortFunding / 365);
+
+        const s = spreadRates(x, fixedShort, baseSpread);
+        spreadLong.push(s.longSpread);
+        spreadShort.push(s.shortSpread);
+
+        const ratio = allowedRatio(x + fixedShort, buffer, k, maxRatio, minRatio);
+        ratioValues.push(ratio);
+
+        const risk = alphaAndNeedLock(x * 0.10, fixedShort * 0.10, alphaMin, alphaScale);
+        alphaValues.push(risk.alpha * 100);
+        needLockValues.push(risk.needLock / 1000); // displayed in k$
+      }
+
+      drawLineChart(
+        document.getElementById("chartFunding"),
+        `Funding journalier si Long OI varie de 0 à 150k (Short fixé à ${fixedShort.toLocaleString()}$)`,
+        labels,
+        fundingLong,
+        fundingShort,
+        "% / jour",
+        "funding"
+      );
+
+      drawLineChart(
+        document.getElementById("chartSpread"),
+        `Spread si Long OI varie de 0 à 150k (Short fixé à ${fixedShort.toLocaleString()}$)`,
+        labels,
+        spreadLong,
+        spreadShort,
+        "% spread",
+        "spread"
+      );
+
+      drawLineChart(
+        document.getElementById("chartRisk"),
+        `Risk engine si Long OI varie de 0 à 150k (Short fixé à ${fixedShort.toLocaleString()}$)`,
+        labels,
+        ratioValues,
+        alphaValues,
+        "ratio / alpha",
+        "risk"
+      );
+    }
+
+    longInput.addEventListener("input", calculate);
+    shortInput.addEventListener("input", calculate);
+    baseInput.addEventListener("input", calculate);
+    spreadInput.addEventListener("input", calculate);
+    bufferInput.addEventListener("input", calculate);
+    kInput.addEventListener("input", calculate);
+    maxRatioInput.addEventListener("input", calculate);
+    minRatioInput.addEventListener("input", calculate);
+    alphaMinInput.addEventListener("input", calculate);
+    alphaScaleInput.addEventListener("input", calculate);
+    window.addEventListener("resize", drawCharts);
+
+    calculate();
+  </script>
+</body>
+</html>
